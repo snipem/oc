@@ -232,7 +232,19 @@ fn read_key() -> Key {
             b'\r' | b'\n'           => Key::Enter,
             0x7f | 0x08             => Key::Backspace,
             b if b.is_ascii()       => Key::Char(b as char),
-            _ => continue 'outer,
+            b => {
+                let extra = if b >= 0xF0 { 3 } else if b >= 0xE0 { 2 } else if b >= 0xC0 { 1 } else { continue 'outer };
+                let mut buf = [0u8; 4];
+                buf[0] = b;
+                for i in 1..=extra { buf[i] = read_byte(); }
+                match std::str::from_utf8(&buf[..=extra]) {
+                    Ok(s) => match s.chars().next() {
+                        Some(c) => Key::Char(c),
+                        None    => continue 'outer,
+                    },
+                    Err(_) => continue 'outer,
+                }
+            }
         };
     }
 }
@@ -446,16 +458,33 @@ impl Pane {
             .map(|e| e.name.clone())
             .collect()
     }
+
+    fn in_marker_mode(&self) -> bool { let Pane::Local(p) = self; p.marker_anchor.is_some() }
+    fn enter_marker_mode(&mut self) {
+        let Pane::Local(p) = self;
+        p.marker_anchor = Some(p.cursor);
+        p.selected = std::iter::once(p.cursor).collect();
+    }
+    fn exit_marker_mode(&mut self) { let Pane::Local(p) = self; p.marker_anchor = None; }
+    fn sync_marker(&mut self) {
+        let Pane::Local(p) = self;
+        if let Some(anchor) = p.marker_anchor {
+            let lo = anchor.min(p.cursor);
+            let hi = anchor.max(p.cursor);
+            p.selected = (lo..=hi).collect();
+        }
+    }
 }
 
 struct LocalPane {
-    path:     PathBuf,
-    entries:  Vec<FileEntry>,
-    cursor:   usize,
-    offset:   usize,
-    sort:     SortBy,
-    reverse:  bool,
-    selected: std::collections::BTreeSet<usize>,
+    path:          PathBuf,
+    entries:       Vec<FileEntry>,
+    cursor:        usize,
+    offset:        usize,
+    sort:          SortBy,
+    reverse:       bool,
+    selected:      std::collections::BTreeSet<usize>,
+    marker_anchor: Option<usize>,
 }
 
 impl LocalPane {
@@ -463,7 +492,7 @@ impl LocalPane {
         let mut p = LocalPane {
             path: PathBuf::from(path).canonicalize().unwrap_or_else(|_| PathBuf::from(".")),
             entries: vec![], cursor: 0, offset: 0, sort: SortBy::Name, reverse: false,
-            selected: std::collections::BTreeSet::new(),
+            selected: std::collections::BTreeSet::new(), marker_anchor: None,
         };
         p.refresh(); p
     }
@@ -498,9 +527,10 @@ impl LocalPane {
         if self.path.parent().is_some() {
             items.insert(0, FileEntry { name: "..".to_string(), is_dir: true, size: 0 });
         }
-        self.entries  = items;
-        self.cursor   = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.entries       = items;
+        self.cursor        = self.cursor.min(self.entries.len().saturating_sub(1));
         self.selected.clear();
+        self.marker_anchor = None;
     }
 
     fn enter(&mut self) {
@@ -914,6 +944,44 @@ fn op_move(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     src.refresh(); dst.refresh();
 }
 
+fn now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (s, m, h) = (secs % 60, (secs / 60) % 60, (secs / 3600) % 24);
+    let mut days = secs / 86400;
+    let mut y = 1970u64;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        let dy = if leap { 366 } else { 365 };
+        if days < dy { break; }
+        days -= dy; y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let mlen: [u64; 12] = if leap { [31,29,31,30,31,30,31,31,30,31,30,31] }
+                          else     { [31,28,31,30,31,30,31,31,30,31,30,31] };
+    let mut mo = 1u64;
+    for &dm in &mlen { if days < dm { break; } days -= dm; mo += 1; }
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", y, mo, days + 1, h, m, s)
+}
+
+fn trash_file(path: &std::path::Path) -> std::io::Result<()> {
+    let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+        format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    });
+    let t_files = std::path::PathBuf::from(&data_home).join("Trash/files");
+    let t_info  = std::path::PathBuf::from(&data_home).join("Trash/info");
+    fs::create_dir_all(&t_files)?;
+    fs::create_dir_all(&t_info)?;
+    let base = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "unnamed".into());
+    let mut name = base.clone();
+    let mut n = 1u32;
+    while t_files.join(&name).exists() { name = format!("{}.{}", base, n); n += 1; }
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    fs::write(t_info.join(format!("{}.trashinfo", name)),
+              format!("[Trash Info]\nPath={}\nDeletionDate={}\n", abs.display(), now_iso8601()))?;
+    fs::rename(path, t_files.join(&name))
+}
+
 fn op_delete(o: &mut Out, p: &mut Pane) {
     let names: Vec<String> = if p.has_selection() {
         p.selected_names()
@@ -923,12 +991,12 @@ fn op_delete(o: &mut Out, p: &mut Pane) {
     if names.is_empty() { return; }
     let label = if names.len() == 1 { format!("'{}'", names[0]) }
                 else { format!("{} items", names.len()) };
-    let Some(ans) = prompt(o, &format!("Delete {}? [y/N]", label), "") else { return };
+    let Some(ans) = prompt(o, &format!("Trash {}? [y/N]", label), "") else { return };
     if ans.to_lowercase() != "y" { return; }
     let lp = p.as_local_mut();
     for name in &names {
         let path = lp.path.join(name);
-        if let Err(e) = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) } {
+        if let Err(e) = trash_file(&path) {
             flash(o, &format!(" Error: {}", e));
         }
     }
@@ -1045,6 +1113,37 @@ fn draw_nc_box(o: &mut Out, row0: u16, col0: u16, box_w: usize, box_h: usize, ti
     inner_w
 }
 
+fn show_error_dialog(o: &mut Out, title: &str, lines: &[String]) {
+    let (rows, cols) = term_size();
+    let (rows, cols) = (rows as usize, cols as usize);
+    let max_vis = rows.saturating_sub(8).max(3);
+    let visible = lines.len().min(max_vis).max(1);
+    let box_w = lines.iter().map(|s| s.chars().count()).max().unwrap_or(20)
+                    .max(title.chars().count() + 4)
+                    .max(22) + 4;
+    let box_w = box_w.clamp(26, cols.saturating_sub(4));
+    let inner_w = box_w.saturating_sub(2);
+    // +1 for the "press any key" hint row
+    let box_h = visible + 1;
+    let row0 = ((rows.saturating_sub(box_h + 2)) / 2 + 1) as u16;
+    let col0 = ((cols.saturating_sub(box_w))     / 2 + 1) as u16;
+    draw_nc_box(o, row0, col0, box_w, box_h, title);
+    for (i, line) in lines.iter().take(visible).enumerate() {
+        goto(o, row0 + 1 + i as u16, col0 + 1);
+        tc!(o, fg 0xff,0x55,0x55);
+        let truncated: String = line.chars().take(inner_w).collect();
+        write!(o, "{:<w$}", truncated, w = inner_w).unwrap();
+    }
+    goto(o, row0 + 1 + visible as u16, col0 + 1);
+    c_hdr_act(o);
+    let hint = "[ Press any key ]";
+    let pad = inner_w.saturating_sub(hint.len()) / 2;
+    write!(o, "{:pad$}{}", "", hint, pad = pad).unwrap();
+    c_reset(o);
+    o.flush().unwrap();
+    read_key();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Generic arrow-key picker overlay
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1156,18 +1255,33 @@ fn op_rclone_mount(o: &mut Out, panes: &mut [Pane; 2], mounts: &mut Vec<String>)
     let mut cmd = std::process::Command::new("rclone");
     cmd.args(["mount", &format!("{}:", remote), &mp, "--vfs-cache-mode", "writes"]);
     if let Some(cfg) = rclone_config_flag() { cmd.args(["--config", &cfg]); }
-    if let Err(e) = cmd.spawn() {
-        flash(o, &format!(" rclone spawn failed: {}", e)); return;
-    }
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => { flash(o, &format!(" rclone spawn failed: {}", e)); return; }
+    };
 
     // poll /proc/mounts until FUSE is ready (up to 10 s)
     let mut ready = false;
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if is_mounted(&mp) { ready = true; break; }
+        if matches!(child.try_wait(), Ok(Some(_))) { break; }
     }
     if !ready {
-        flash(o, &format!(" Timeout waiting for {} to mount", remote));
+        let _ = child.kill();
+        let stderr_out = child.stderr.take().map(|mut se| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = se.read_to_string(&mut buf);
+            buf
+        }).unwrap_or_default();
+        let lines: Vec<String> = if stderr_out.trim().is_empty() {
+            vec![format!("Timeout waiting for {} to mount", remote)]
+        } else {
+            stderr_out.lines().map(String::from).collect()
+        };
+        show_error_dialog(o, &format!(" rclone: {} ", remote), &lines);
         return;
     }
 
@@ -1484,10 +1598,80 @@ fn print_help() {
     println!("  scroll                move cursor ±3 rows");
 }
 
+fn dump_ui(left: &str, right: &str, width: usize) {
+    let lp_raw = make_pane(left);
+    let rp_raw = make_pane(right);
+    let lp = lp_raw.as_local();
+    let rp = rp_raw.as_local();
+
+    let half    = width / 2;
+    let inner_l = half.saturating_sub(1);
+    let inner_r = width.saturating_sub(half + 2);
+    let col_l   = inner_l.saturating_sub(2);
+    let col_r   = inner_r.saturating_sub(2);
+
+    fn title_border(title: &str, w: usize) {
+        let seg  = format!(" {} ", title);
+        let slen = seg.chars().count();
+        let (lp, rp) = if slen < w { let l = (w - slen) / 2; (l, w - slen - l) } else { (0, 0) };
+        let seg: String = seg.chars().take(w).collect();
+        for _ in 0..lp  { print!("═"); }
+        print!("{}", seg);
+        for _ in 0..rp { print!("═"); }
+    }
+
+    // top border
+    print!("╔"); title_border(&lp.title(), inner_l);
+    print!("╦"); title_border(&rp.title(), inner_r);
+    println!("╗");
+
+    // content rows — all entries, no viewport clipping
+    let n = lp.entries.len().max(rp.entries.len());
+    for i in 0..n {
+        print!("║");
+        if let Some(e) = lp.entries.get(i) {
+            let m = if i == lp.cursor { '>' } else if lp.selected.contains(&i) { '*' } else { ' ' };
+            print!("{} {}", m, e.display(col_l));
+        } else {
+            print!("{:<w$}", "", w = inner_l);
+        }
+        print!("║");
+        if let Some(e) = rp.entries.get(i) {
+            let m = if i == rp.cursor { '>' } else if rp.selected.contains(&i) { '*' } else { ' ' };
+            print!("{} {}", m, e.display(col_r));
+        } else {
+            print!("{:<w$}", "", w = inner_r);
+        }
+        println!("║");
+    }
+
+    // bottom border
+    print!("╚"); for _ in 0..inner_l { print!("═"); }
+    print!("╩"); for _ in 0..inner_r { print!("═"); }
+    println!("╝");
+
+    // f-key bar
+    for &(num, label) in FKEYS { print!("{}{} ", num, label); }
+    println!();
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        return;
+    }
+    if args.iter().any(|a| a == "--dump") {
+        let width_arg = args.iter().position(|a| a == "--width")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(120);
+        let paths: Vec<&str> = args.iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(String::as_str).collect();
+        let left  = paths.get(0).copied().unwrap_or(".");
+        let right = paths.get(1).copied().unwrap_or(".");
+        dump_ui(left, right, width_arg);
         return;
     }
     let left  = args.get(0).map(String::as_str).unwrap_or(".");
@@ -1519,25 +1703,37 @@ fn main() {
             Key::Char('\t') => active ^= 1,
 
             // ── Navigation ──────────────────────────────────────────────────
-            Key::Up       => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(1); }
+            Key::Up       => {
+                let c = panes[active].cursor_mut(); *c = c.saturating_sub(1);
+                panes[active].sync_marker();
+            }
             Key::Down     => {
                 let len = panes[active].entries().len();
                 let c   = panes[active].cursor_mut();
                 if *c + 1 < len { *c += 1; }
+                panes[active].sync_marker();
             }
-            Key::PageUp   => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(visible); }
+            Key::PageUp   => {
+                let c = panes[active].cursor_mut(); *c = c.saturating_sub(visible);
+                panes[active].sync_marker();
+            }
             Key::PageDown => {
                 let len = panes[active].entries().len();
                 let c   = panes[active].cursor_mut();
                 *c = (*c + visible).min(len.saturating_sub(1));
+                panes[active].sync_marker();
             }
-            Key::Home => { *panes[active].cursor_mut() = 0; }
+            Key::Home => {
+                *panes[active].cursor_mut() = 0;
+                panes[active].sync_marker();
+            }
             Key::End  => {
                 let last = panes[active].entries().len().saturating_sub(1);
                 *panes[active].cursor_mut() = last;
+                panes[active].sync_marker();
             }
-            Key::Enter | Key::Right => panes[active].enter(),
-            Key::Left | Key::Backspace => panes[active].back(),
+            Key::Enter | Key::Right => { panes[active].exit_marker_mode(); panes[active].enter(); }
+            Key::Left | Key::Backspace => { panes[active].exit_marker_mode(); panes[active].back(); }
 
             // ── Selection ───────────────────────────────────────────────────
             Key::Insert => {
@@ -1552,7 +1748,7 @@ fn main() {
                 panes[active].toggle_sel(idx);
             }
             Key::Char('\x01') => panes[active].select_all(),    // Ctrl+A
-            Key::Esc          => panes[active].clear_sel(),
+            Key::Esc          => { panes[active].exit_marker_mode(); panes[active].clear_sel(); }
             Key::Delete       => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
 
             // ── F-keys ──────────────────────────────────────────
@@ -1568,21 +1764,33 @@ fn main() {
             Key::F(10) => break,
 
             // ── Vim-style letter bindings ───────────────────────────────────
+            Key::Char('V') => {
+                if panes[active].in_marker_mode() { panes[active].exit_marker_mode(); }
+                else { panes[active].enter_marker_mode(); }
+            }
             Key::Char('j') => {
                 let len = panes[active].entries().len();
                 let c   = panes[active].cursor_mut();
                 if *c + 1 < len { *c += 1; }
+                panes[active].sync_marker();
             }
-            Key::Char('k') => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(1); }
+            Key::Char('k') => {
+                let c = panes[active].cursor_mut(); *c = c.saturating_sub(1);
+                panes[active].sync_marker();
+            }
             Key::Char('/') => { if let Some(q) = op_search(&mut o, &mut panes, active) { last_query = q; } }
             Key::Char('n') => search_jump(&mut panes, active, &last_query, true),
             Key::Char('N') => search_jump(&mut panes, active, &last_query, false),
             Key::Char('e') => { let (a, _) = split(&mut panes, active); op_edit(&mut o, a); }
             Key::Char('d') if last_char == 'd' => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
-            Key::Char('g') if last_char == 'g' => { *panes[active].cursor_mut() = 0; }
+            Key::Char('g') if last_char == 'g' => {
+                *panes[active].cursor_mut() = 0;
+                panes[active].sync_marker();
+            }
             Key::Char('G') => {
                 let last = panes[active].entries().len().saturating_sub(1);
                 *panes[active].cursor_mut() = last;
+                panes[active].sync_marker();
             }
             Key::Char('g') => { /* first half of gg — wait for second g */ }
             Key::Char('\'') => { let (a, _) = split(&mut panes, active); op_goto(&mut o, a); }
