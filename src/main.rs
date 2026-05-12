@@ -265,7 +265,7 @@ fn clr(o: &mut Out) {
 fn goto(o: &mut Out, r: u16, c: u16) { write!(o, "\x1b[{};{}H", r, c).unwrap(); }
 fn hide_cur(o: &mut Out)       { esc!(o, "?25l"); }
 fn show_cur(o: &mut Out)       { esc!(o, "?25h"); }
-// CGA exact hex values — exact DOS Norton Commander colours via 24-bit SGR
+// CGA exact hex values — exact DOS CGA colours via 24-bit SGR
 // so the terminal's own palette remapping cannot alter them.
 //   blue  #0000AA   cyan  #00AAAA   bright-cyan  #55FFFF
 //   white #FFFFFF   lgray #AAAAAA   dgray        #555555
@@ -273,10 +273,10 @@ fn show_cur(o: &mut Out)       { esc!(o, "?25h"); }
 
 fn c_reset(o: &mut Out) { esc!(o, "0m"); }
 
-// Active pane header / dialog box borders — yellow on NC blue
+// Active pane header / dialog box borders — yellow on blue
 fn c_hdr_act(o: &mut Out) { tc!(o, fg 0xFF,0xFF,0x55); tc!(o, bg 0x00,0x00,0xAA); }
 
-// Inactive pane header — light grey on NC blue
+// Inactive pane header — light grey on blue
 fn c_hdr(o: &mut Out) { tc!(o, fg 0xAA,0xAA,0xAA); tc!(o, bg 0x00,0x00,0xAA); }
 
 // Selected item in the active pane — black on dark cyan
@@ -285,16 +285,16 @@ fn c_sel(o: &mut Out) { tc!(o, fg 0x00,0x00,0x00); tc!(o, bg 0x00,0xAA,0xAA); }
 // Selected item in the inactive pane — light grey on dark grey
 fn c_sel_inactive(o: &mut Out) { tc!(o, fg 0xAA,0xAA,0xAA); tc!(o, bg 0x55,0x55,0x55); }
 
-// Directory entries — bright white on NC blue
+// Directory entries — bright white on blue
 fn c_dir(o: &mut Out) { tc!(o, fg 0xFF,0xFF,0xFF); tc!(o, bg 0x00,0x00,0xAA); }
 
-// Normal files and dialog interior — bright cyan on NC blue
+// Normal files and dialog interior — bright cyan on blue
 fn c_norm(o: &mut Out) { tc!(o, fg 0x55,0xFF,0xFF); tc!(o, bg 0x00,0x00,0xAA); }
 
 // Status / function-key bar — black on dark cyan
 fn c_status(o: &mut Out) { tc!(o, fg 0x00,0x00,0x00); tc!(o, bg 0x00,0xAA,0xAA); }
 
-// Selected file (not cursor) — yellow on NC blue
+// Selected file (not cursor) — yellow on blue
 fn c_sel_file(o: &mut Out) { tc!(o, fg 0xFF,0xFF,0x55); tc!(o, bg 0x00,0x00,0xAA); }
 
 fn human_size(n: u64) -> String {
@@ -837,7 +837,7 @@ fn draw_fkey_bar(o: &mut Out, rows: u16, cols: usize) {
     for &(num, label) in FKEYS {
         let entry_len = num.len() + label.len() + 1; // +1 trailing space
         if used + entry_len > cols { break; }
-        // number: bright cyan on black  (exact NC look)
+        // number: bright cyan on black  (exact classic look)
         tc!(o, fg 0x55,0xFF,0xFF); tc!(o, bg 0x00,0x00,0x00);
         write!(o, "{}", num).unwrap();
         // label: black on dark cyan
@@ -1102,7 +1102,7 @@ fn op_sort(o: &mut Out, p: &mut Pane) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Norton Commander–style double-line box helper
+// Double-line box helper
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Draw a ╔══╡ Title ╞══╗ … ╚══════╝ frame.
@@ -1571,7 +1571,7 @@ fn main() {
             Key::Esc          => panes[active].clear_sel(),
             Key::Delete       => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
 
-            // ── F-keys (NC layout) ──────────────────────────────────────────
+            // ── F-keys ──────────────────────────────────────────
             Key::F(1)  => op_help(&mut o),
             Key::F(2)  => { let (a, _) = split(&mut panes, active); op_rename(&mut o, a); }
             Key::F(3)  => { let (a, _) = split(&mut panes, active); op_view(&mut o, a); }
