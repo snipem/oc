@@ -590,7 +590,11 @@ impl Pane {
     }
     fn selected_names(&self) -> Vec<String> {
         let sel = match self { Pane::Local(p) => &p.selected, Pane::Remote(p) => &p.selected };
-        sel.iter().filter_map(|&i| self.entries().get(i).map(|e| e.name.clone())).collect()
+        sel.iter()
+            .filter_map(|&i| self.entries().get(i))
+            .filter(|e| e.name != "..")
+            .map(|e| e.name.clone())
+            .collect()
     }
 }
 
@@ -641,6 +645,9 @@ impl LocalPane {
             let file_ord = if reverse { file_ord.reverse() } else { file_ord };
             dir_ord.then(file_ord)
         });
+        if self.path.parent().is_some() {
+            items.insert(0, FileEntry { name: "..".to_string(), is_dir: true, size: 0 });
+        }
         self.entries  = items;
         self.cursor   = self.cursor.min(self.entries.len().saturating_sub(1));
         self.selected.clear();
@@ -649,9 +656,13 @@ impl LocalPane {
     fn enter(&mut self) {
         if let Some(e) = self.entries.get(self.cursor).cloned() {
             if e.is_dir {
-                self.path = self.path.join(&e.name);
-                self.cursor = 0; self.offset = 0;
-                self.refresh();
+                if e.name == ".." {
+                    self.back();
+                } else {
+                    self.path = self.path.join(&e.name);
+                    self.cursor = 0; self.offset = 0;
+                    self.refresh();
+                }
             }
         }
     }
@@ -870,6 +881,8 @@ fn draw_info_row(o: &mut Out, row: u16, cols: usize, _pane: &Pane) {
 }
 
 fn render(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
+    tc!(o, bg 0x00,0x00,0xAA);
+    write!(o, "\x1b[2J").unwrap();
     let (rows, cols) = term_size();
     let cols = cols as usize;
     let half = cols / 2;
@@ -956,6 +969,7 @@ fn op_rename(o: &mut Out, p: &mut Pane) {
     if p.is_remote() { flash(o, " Remote rename not supported"); return; }
     let lp = p.as_local_mut().unwrap();
     let Some(e) = lp.entries.get(lp.cursor).cloned() else { return };
+    if e.name == ".." { return; }
     let Some(new) = prompt(o, "Rename to", &e.name) else { return };
     if new.is_empty() || new == e.name { return; }
     if let Err(e) = fs::rename(lp.path.join(&e.name), lp.path.join(&new)) {
@@ -967,7 +981,7 @@ fn op_rename(o: &mut Out, p: &mut Pane) {
 fn op_copy(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     if src.is_remote() || dst.is_remote() { flash(o, " Remote copy not supported"); return; }
     let names: Vec<String> = if src.has_selection() { src.selected_names() }
-        else { src.current().map(|e| vec![e.name.clone()]).unwrap_or_default() };
+        else { src.current().filter(|e| e.name != "..").map(|e| vec![e.name.clone()]).unwrap_or_default() };
     if names.is_empty() { return; }
     let spath = src.as_local().unwrap().path.clone();
     let dpath = dst.as_local().unwrap().path.clone();
@@ -986,7 +1000,7 @@ fn op_copy(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
 fn op_move(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     if src.is_remote() || dst.is_remote() { flash(o, " Remote move not supported"); return; }
     let names: Vec<String> = if src.has_selection() { src.selected_names() }
-        else { src.current().map(|e| vec![e.name.clone()]).unwrap_or_default() };
+        else { src.current().filter(|e| e.name != "..").map(|e| vec![e.name.clone()]).unwrap_or_default() };
     if names.is_empty() { return; }
     let spath = src.as_local().unwrap().path.clone();
     let dpath = dst.as_local().unwrap().path.clone();
@@ -1012,7 +1026,7 @@ fn op_delete(o: &mut Out, p: &mut Pane) {
     let names: Vec<String> = if p.has_selection() {
         p.selected_names()
     } else {
-        p.current().map(|e| vec![e.name.clone()]).unwrap_or_default()
+        p.current().filter(|e| e.name != "..").map(|e| vec![e.name.clone()]).unwrap_or_default()
     };
     if names.is_empty() { return; }
     let label = if names.len() == 1 { format!("'{}'", names[0]) }
@@ -1584,6 +1598,12 @@ fn main() {
             Key::F(10) => break,
 
             // ── Vim-style letter bindings ───────────────────────────────────
+            Key::Char('j') => {
+                let len = panes[active].entries().len();
+                let c   = panes[active].cursor_mut();
+                if *c + 1 < len { *c += 1; }
+            }
+            Key::Char('k') => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(1); }
             Key::Char('/') => op_search(&mut o, &mut panes, active),
             Key::Char('e') => { let (a, _) = split(&mut panes, active); op_edit(&mut o, a); }
             Key::Char('d') if last_char == 'd' => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
