@@ -949,16 +949,99 @@ fn prompt(o: &mut Out, label: &str, default: &str) -> Option<String> {
 // File operations (local only; remote panes show a notice)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn copy_rec(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {
+fn dir_size(path: &std::path::Path) -> u64 {
+    if path.is_dir() {
+        fs::read_dir(path).map(|rd| rd.flatten().map(|e| dir_size(&e.path())).sum()).unwrap_or(0)
+    } else {
+        path.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+struct CopyProgress {
+    total:     u64,
+    done:      u64,
+    start:     std::time::Instant,
+    last_draw: std::time::Instant,
+    showing:   bool,
+}
+
+impl CopyProgress {
+    fn new(total: u64) -> Self {
+        let now = std::time::Instant::now();
+        CopyProgress { total, done: 0, start: now, last_draw: now, showing: false }
+    }
+
+    fn advance(&mut self, o: &mut Out, bytes: u64, name: &str) {
+        self.done += bytes;
+        let now = std::time::Instant::now();
+        if !self.showing && self.start.elapsed().as_secs_f64() >= 1.0 {
+            self.showing = true;
+        }
+        if self.showing && now.duration_since(self.last_draw).as_millis() >= 80 {
+            self.draw(o, name);
+            self.last_draw = now;
+        }
+    }
+
+    fn draw(&self, o: &mut Out, name: &str) {
+        let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
+        let speed   = self.done as f64 / elapsed;
+        let pct     = if self.total > 0 { (self.done * 100 / self.total) as usize } else { 100 };
+        let eta     = if speed > 0.0 && self.total > self.done {
+            let s = ((self.total - self.done) as f64 / speed) as u64;
+            format!("{:02}:{:02}", s / 60, s % 60)
+        } else { "--:--".to_string() };
+        let speed_s = format!("{}/s", human_size(speed as u64));
+
+        let (rows, cols) = term_size();
+        let cols = cols as usize;
+        let name_disp: String = name.chars().take(30).collect();
+        let meta = format!(" {:3}%  {}  ETA {} ", pct, speed_s, eta);
+        let bar_w = cols.saturating_sub(name_disp.len() + meta.len() + 2);
+        let filled = (bar_w * pct / 100).min(bar_w);
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
+
+        goto(o, rows - 1, 1);
+        c_status(o);
+        write!(o, " {}{}{}", name_disp, meta, bar).unwrap();
+        let used = 1 + name_disp.len() + meta.len() + bar_w;
+        if used < cols { write!(o, "{:<w$}", "", w = cols - used).unwrap(); }
+        c_reset(o);
+        o.flush().unwrap();
+    }
+
+    fn finish(&self, o: &mut Out) {
+        if self.showing { self.draw(o, ""); }
+    }
+}
+
+fn copy_file_prog(o: &mut Out, src: &std::path::Path, dst: &std::path::Path,
+                  prog: &mut CopyProgress) -> io::Result<()> {
+    use io::{Read, Write};
+    if let Some(p) = dst.parent() { fs::create_dir_all(p)?; }
+    let mut src_f = fs::File::open(src)?;
+    let mut dst_f = fs::File::create(dst)?;
+    let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = src_f.read(&mut buf)?;
+        if n == 0 { break; }
+        dst_f.write_all(&buf[..n])?;
+        prog.advance(o, n as u64, &name);
+    }
+    Ok(())
+}
+
+fn copy_rec(o: &mut Out, src: &std::path::Path, dst: &std::path::Path,
+            prog: &mut CopyProgress) -> io::Result<()> {
     if src.is_dir() {
         fs::create_dir_all(dst)?;
         for e in fs::read_dir(src)? {
             let e = e?;
-            copy_rec(&e.path(), &dst.join(e.file_name()))?;
+            copy_rec(o, &e.path(), &dst.join(e.file_name()), prog)?;
         }
     } else {
-        if let Some(p) = dst.parent() { fs::create_dir_all(p)?; }
-        fs::copy(src, dst)?;
+        copy_file_prog(o, src, dst, prog)?;
     }
     Ok(())
 }
@@ -988,10 +1071,17 @@ fn op_copy(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     let Some(target) = prompt(o, "Copy to", &default) else { return };
     if target.is_empty() { return; }
     let dst_root = std::path::PathBuf::from(&target);
+    let total: u64 = names.iter().map(|n| dir_size(&spath.join(n))).sum();
+    let mut prog = CopyProgress::new(total);
+    let mut err: Option<String> = None;
     for name in &names {
         let dst_p = if names.len() == 1 { dst_root.clone() } else { dst_root.join(name) };
-        if let Err(e) = copy_rec(&spath.join(name), &dst_p) { flash(o, &format!(" Error: {}", e)); }
+        if let Err(e) = copy_rec(o, &spath.join(name), &dst_p, &mut prog) {
+            err = Some(format!(" Error: {}", e)); break;
+        }
     }
+    prog.finish(o);
+    if let Some(msg) = err { flash(o, &msg); }
     src.refresh(); dst.refresh();
 }
 
@@ -1007,15 +1097,20 @@ fn op_move(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     let Some(target) = prompt(o, "Move to", &default) else { return };
     if target.is_empty() { return; }
     let dst_root = std::path::PathBuf::from(&target);
+    let total: u64 = names.iter().map(|n| dir_size(&spath.join(n))).sum();
+    let mut prog = CopyProgress::new(total);
+    let mut err: Option<String> = None;
     for name in &names {
         let src_p = spath.join(name);
         let dst_p = if names.len() == 1 { dst_root.clone() } else { dst_root.join(name) };
         let result = fs::rename(&src_p, &dst_p).or_else(|_| {
-            copy_rec(&src_p, &dst_p)?;
+            copy_rec(o, &src_p, &dst_p, &mut prog)?;
             if src_p.is_dir() { fs::remove_dir_all(&src_p) } else { fs::remove_file(&src_p) }
         });
-        if let Err(e) = result { flash(o, &format!(" Error: {}", e)); }
+        if let Err(e) = result { err = Some(format!(" Error: {}", e)); break; }
     }
+    prog.finish(o);
+    if let Some(msg) = err { flash(o, &msg); }
     src.refresh(); dst.refresh();
 }
 
