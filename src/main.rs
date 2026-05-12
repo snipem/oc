@@ -1679,8 +1679,56 @@ fn split(panes: &mut [Pane; 2], active: usize) -> (&mut Pane, &mut Pane) {
     if active == 0 { (a, b) } else { (b, a) }
 }
 
+fn print_help() {
+    println!("oc — two-pane terminal file manager\n");
+    println!("Usage:  oc [LEFT_PATH [RIGHT_PATH]]");
+    println!("        oc ftp://host  (opens FTP pane)\n");
+    println!("Navigation");
+    println!("  Tab / Shift+Tab       switch active pane");
+    println!("  ↑↓ / j k              move cursor");
+    println!("  PgUp / PgDn           page up / down");
+    println!("  Home / End            first / last entry");
+    println!("  gg / G                top / bottom");
+    println!("  / query               incremental search");
+    println!("  n / N                 next / prev match");
+    println!("  Enter / →             enter dir or open file");
+    println!("  ← / Backspace         parent directory\n");
+    println!("Selection");
+    println!("  Insert                toggle selection + move down");
+    println!("  Space                 toggle selection");
+    println!("  Ctrl+A                select all");
+    println!("  Esc                   deselect all\n");
+    println!("File Operations");
+    println!("  F1 / ?                this help (in-app)");
+    println!("  F2 / r                rename");
+    println!("  F3                    view in pager");
+    println!("  F4 / e                edit file");
+    println!("  F5                    copy to other pane");
+    println!("  F6                    move to other pane");
+    println!("  F7                    create directory");
+    println!("  F8 / dd / Del         delete");
+    println!("  F9                    context menu");
+    println!("  F10 / q               quit\n");
+    println!("Misc");
+    println!("  S                     sync panes");
+    println!("  '                     go to path");
+    println!("  s                     sort");
+    println!("  R                     refresh");
+    println!("  C                     rclone remote mount");
+    println!("  f                     FTP connect (netrc)\n");
+    println!("Mouse");
+    println!("  left click            switch pane / move cursor");
+    println!("  double click          enter dir or open file");
+    println!("  right click           go to parent directory");
+    println!("  scroll                move cursor ±3 rows");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
     let left  = args.get(0).map(String::as_str).unwrap_or(".");
     let right = args.get(1).map(String::as_str).unwrap_or(".");
 
