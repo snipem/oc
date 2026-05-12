@@ -881,8 +881,6 @@ fn draw_info_row(o: &mut Out, row: u16, cols: usize, _pane: &Pane) {
 }
 
 fn render(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
-    tc!(o, bg 0x00,0x00,0xAA);
-    write!(o, "\x1b[2J").unwrap();
     let (rows, cols) = term_size();
     let cols = cols as usize;
     let half = cols / 2;
@@ -1461,6 +1459,7 @@ fn op_context_menu(o: &mut Out, panes: &mut [Pane; 2], active: usize, mounts: &m
         "Refresh (R)".into(),
     ];
     let Some(idx) = picker(o, "Menu", &items) else { return };
+    render(o, panes, active); // clear picker overlay before next dialog
     match idx {
         0  => { let (a, _) = split(panes, active); op_view(o, a); }
         1  => { let (a, _) = split(panes, active); op_edit(o, a); }
