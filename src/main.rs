@@ -132,7 +132,8 @@ fn read_byte_timed(tenths: u8) -> Option<u8> {
 #[derive(Debug, Clone)]
 enum Key {
     Char(char), Up, Down, Left, Right,
-    Enter, PageUp, PageDown, Home, End,
+    Enter, Backspace, Insert, Delete,
+    PageUp, PageDown, Home, End,
     Esc, F(u8),
     Click  { btn: u8, col: u16, row: u16 },
     Scroll { up: bool, col: u16, row: u16 },
@@ -179,6 +180,7 @@ fn parse_csi(buf: &[u8]) -> Option<Key> {
             b'A' => Key::Up,    b'B' => Key::Down,
             b'C' => Key::Right, b'D' => Key::Left,
             b'H' => Key::Home,  b'F' => Key::End,
+            b'Z' => Key::Char('\t'), // Shift+Tab — same action as Tab (toggle pane)
             _ => return None,
         });
     }
@@ -188,6 +190,8 @@ fn parse_csi(buf: &[u8]) -> Option<Key> {
     Some(match (n, fin) {
         (1|7, b'~') | (_, b'H') => Key::Home,
         (4|8, b'~') | (_, b'F') => Key::End,
+        (2, b'~')  => Key::Insert,
+        (3, b'~')  => Key::Delete,
         (5, b'~')  => Key::PageUp,
         (6, b'~')  => Key::PageDown,
         (11, b'~') => Key::F(1),  (12, b'~') => Key::F(2),
@@ -227,8 +231,9 @@ fn read_key() -> Key {
                 None => Key::Esc,
                 _    => continue 'outer,
             },
-            b'\r' | b'\n' => Key::Enter,
-            b if b.is_ascii() => Key::Char(b as char),
+            b'\r' | b'\n'           => Key::Enter,
+            0x7f | 0x08             => Key::Backspace,
+            b if b.is_ascii()       => Key::Char(b as char),
             _ => continue 'outer,
         };
     }
@@ -241,27 +246,68 @@ fn read_key() -> Key {
 type Out = BufWriter<io::Stdout>;
 
 macro_rules! esc { ($o:expr, $s:literal) => { write!($o, concat!("\x1b[", $s)).unwrap() } }
+macro_rules! tc {
+    ($o:expr, fg $r:expr, $g:expr, $b:expr) =>
+        { write!($o, "\x1b[38;2;{};{};{}m", $r, $g, $b).unwrap() };
+    ($o:expr, bg $r:expr, $g:expr, $b:expr) =>
+        { write!($o, "\x1b[48;2;{};{};{}m", $r, $g, $b).unwrap() };
+}
 
-fn clr(o: &mut Out)            { esc!(o, "2J"); esc!(o, "H"); }
+fn clr(o: &mut Out) {
+    let (rows, cols) = term_size();
+    tc!(o, bg 0x00,0x00,0xAA); tc!(o, fg 0x55,0xFF,0xFF);
+    for r in 1..=rows {
+        goto(o, r, 1);
+        write!(o, "{:width$}", "", width = cols as usize).unwrap();
+    }
+    goto(o, 1, 1);
+}
 fn goto(o: &mut Out, r: u16, c: u16) { write!(o, "\x1b[{};{}H", r, c).unwrap(); }
 fn hide_cur(o: &mut Out)       { esc!(o, "?25l"); }
 fn show_cur(o: &mut Out)       { esc!(o, "?25h"); }
-fn c_reset(o: &mut Out)        { esc!(o, "0m"); }
-fn c_hdr_act(o: &mut Out)      { esc!(o, "1;37;44m"); }  // bold white on blue
-fn c_hdr(o: &mut Out)          { esc!(o, "30;46m"); }    // black on cyan
-fn c_sel(o: &mut Out)          { esc!(o, "1;30;47m"); }  // bold black on white (active pane)
-fn c_sel_inactive(o: &mut Out) { esc!(o, "37;40m"); }    // white on black (inactive pane)
-fn c_dir(o: &mut Out)          { esc!(o, "1;36m"); }     // bold cyan
-fn c_norm(o: &mut Out)         { esc!(o, "0m"); }
-fn c_status(o: &mut Out)       { esc!(o, "30;42m"); }    // black on green
+// CGA exact hex values — exact DOS Norton Commander colours via 24-bit SGR
+// so the terminal's own palette remapping cannot alter them.
+//   blue  #0000AA   cyan  #00AAAA   bright-cyan  #55FFFF
+//   white #FFFFFF   lgray #AAAAAA   dgray        #555555
+//   black #000000   yellow #FFFF55
+
+fn c_reset(o: &mut Out) { esc!(o, "0m"); }
+
+// Active pane header / dialog box borders — yellow on NC blue
+fn c_hdr_act(o: &mut Out) { tc!(o, fg 0xFF,0xFF,0x55); tc!(o, bg 0x00,0x00,0xAA); }
+
+// Inactive pane header — light grey on NC blue
+fn c_hdr(o: &mut Out) { tc!(o, fg 0xAA,0xAA,0xAA); tc!(o, bg 0x00,0x00,0xAA); }
+
+// Selected item in the active pane — black on dark cyan
+fn c_sel(o: &mut Out) { tc!(o, fg 0x00,0x00,0x00); tc!(o, bg 0x00,0xAA,0xAA); }
+
+// Selected item in the inactive pane — light grey on dark grey
+fn c_sel_inactive(o: &mut Out) { tc!(o, fg 0xAA,0xAA,0xAA); tc!(o, bg 0x55,0x55,0x55); }
+
+// Directory entries — bright white on NC blue
+fn c_dir(o: &mut Out) { tc!(o, fg 0xFF,0xFF,0xFF); tc!(o, bg 0x00,0x00,0xAA); }
+
+// Normal files and dialog interior — bright cyan on NC blue
+fn c_norm(o: &mut Out) { tc!(o, fg 0x55,0xFF,0xFF); tc!(o, bg 0x00,0x00,0xAA); }
+
+// Status / function-key bar — black on dark cyan
+fn c_status(o: &mut Out) { tc!(o, fg 0x00,0x00,0x00); tc!(o, bg 0x00,0xAA,0xAA); }
+
+// Selected file (not cursor) — yellow on NC blue
+fn c_sel_file(o: &mut Out) { tc!(o, fg 0xFF,0xFF,0x55); tc!(o, bg 0x00,0x00,0xAA); }
 
 fn human_size(n: u64) -> String {
-    let (mut v, units) = (n as f64, ["B", "K", "M", "G", "T"]);
-    for &u in &units[..4] {
-        if v < 1024.0 { return format!("{:4.0}{}", v, u); }
+    let units = ["B","K","M","G","T"];
+    let mut v = n as f64;
+    for (i, &u) in units.iter().enumerate() {
+        if v < 1024.0 || i == units.len() - 1 {
+            return if v < 10.0 && i > 0 { format!("{:.1}{}", v, u) }
+                   else                  { format!("{:.0}{}", v, u) };
+        }
         v /= 1024.0;
     }
-    format!("{:4.0}T", v)
+    unreachable!()
 }
 
 fn mouse_on(o: &mut Out)  { write!(o, "\x1b[?1000h\x1b[?1006h").unwrap(); o.flush().unwrap(); }
@@ -523,21 +569,47 @@ impl Pane {
     fn current(&self)    -> Option<&FileEntry> { self.entries().get(self.cursor()) }
     fn as_local(&self)   -> Option<&LocalPane> { if let Pane::Local(p)  = self { Some(p) } else { None } }
     fn as_local_mut(&mut self) -> Option<&mut LocalPane> { if let Pane::Local(p) = self { Some(p) } else { None } }
+
+    fn is_selected(&self, idx: usize) -> bool {
+        match self { Pane::Local(p) => p.selected.contains(&idx), Pane::Remote(p) => p.selected.contains(&idx) }
+    }
+    fn toggle_sel(&mut self, idx: usize) {
+        let sel = match self { Pane::Local(p) => &mut p.selected, Pane::Remote(p) => &mut p.selected };
+        if !sel.insert(idx) { sel.remove(&idx); }
+    }
+    fn select_all(&mut self) {
+        let n = self.entries().len();
+        let sel = match self { Pane::Local(p) => &mut p.selected, Pane::Remote(p) => &mut p.selected };
+        *sel = (0..n).collect();
+    }
+    fn clear_sel(&mut self) {
+        match self { Pane::Local(p) => p.selected.clear(), Pane::Remote(p) => p.selected.clear() }
+    }
+    fn has_selection(&self) -> bool {
+        match self { Pane::Local(p) => !p.selected.is_empty(), Pane::Remote(p) => !p.selected.is_empty() }
+    }
+    fn selected_names(&self) -> Vec<String> {
+        let sel = match self { Pane::Local(p) => &p.selected, Pane::Remote(p) => &p.selected };
+        sel.iter().filter_map(|&i| self.entries().get(i).map(|e| e.name.clone())).collect()
+    }
 }
 
 struct LocalPane {
-    path:    PathBuf,
-    entries: Vec<FileEntry>,
-    cursor:  usize,
-    offset:  usize,
-    sort:    SortBy,
+    path:     PathBuf,
+    entries:  Vec<FileEntry>,
+    cursor:   usize,
+    offset:   usize,
+    sort:     SortBy,
+    reverse:  bool,
+    selected: std::collections::BTreeSet<usize>,
 }
 
 impl LocalPane {
     fn new(path: &str) -> Self {
         let mut p = LocalPane {
             path: PathBuf::from(path).canonicalize().unwrap_or_else(|_| PathBuf::from(".")),
-            entries: vec![], cursor: 0, offset: 0, sort: SortBy::Name,
+            entries: vec![], cursor: 0, offset: 0, sort: SortBy::Name, reverse: false,
+            selected: std::collections::BTreeSet::new(),
         };
         p.refresh(); p
     }
@@ -553,9 +625,11 @@ impl LocalPane {
             }
         }
         let sort = self.sort;
+        let reverse = self.reverse;
         items.sort_by(|a, b| {
-            // dirs always before files
-            (!a.is_dir).cmp(&(!b.is_dir)).then_with(|| match sort {
+            // dirs always before files regardless of reverse
+            let dir_ord = (!a.is_dir).cmp(&(!b.is_dir));
+            let file_ord = match sort {
                 SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortBy::Size => a.size.cmp(&b.size),
                 SortBy::Ext  => {
@@ -563,10 +637,13 @@ impl LocalPane {
                     let eb = b.name.rsplit('.').next().unwrap_or("").to_lowercase();
                     ea.cmp(&eb).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 }
-            })
+            };
+            let file_ord = if reverse { file_ord.reverse() } else { file_ord };
+            dir_ord.then(file_ord)
         });
-        self.entries = items;
-        self.cursor  = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.entries  = items;
+        self.cursor   = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.selected.clear();
     }
 
     fn enter(&mut self) {
@@ -596,25 +673,27 @@ impl LocalPane {
 }
 
 struct RemotePane {
-    ftp:     Ftp,
-    entries: Vec<FileEntry>,
-    cursor:  usize,
-    offset:  usize,
-    pwd:     String,
+    ftp:      Ftp,
+    entries:  Vec<FileEntry>,
+    cursor:   usize,
+    offset:   usize,
+    pwd:      String,
+    selected: std::collections::BTreeSet<usize>,
 }
 
 impl RemotePane {
     fn new(mut ftp: Ftp) -> Self {
         let pwd = ftp.pwd();
         let entries = ftp.list().into_iter().map(|e| FileEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect();
-        RemotePane { ftp, entries, cursor: 0, offset: 0, pwd }
+        RemotePane { ftp, entries, cursor: 0, offset: 0, pwd, selected: std::collections::BTreeSet::new() }
     }
 
     fn refresh(&mut self) {
-        self.pwd     = self.ftp.pwd();
-        self.entries = self.ftp.list().into_iter()
+        self.pwd      = self.ftp.pwd();
+        self.entries  = self.ftp.list().into_iter()
             .map(|e| FileEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect();
-        self.cursor  = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.cursor   = self.cursor.min(self.entries.len().saturating_sub(1));
+        self.selected.clear();
     }
 
     fn enter(&mut self) {
@@ -644,65 +723,184 @@ impl RemotePane {
 // Drawing
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn draw_pane(o: &mut Out, pane: &mut Pane, active: bool, row0: u16, rows: u16, col0: u16, cols: usize) {
-    // title bar
-    goto(o, row0, col0);
+// Truncate `s` to at most `max_cols` terminal columns.
+// Nerd Font PUA codepoints (U+E000–U+F8FF) count as 2 columns each.
+fn trunc_cols(s: &str, max_cols: usize) -> &str {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        let w = if (c as u32) >= 0xE000 { 2 } else { 1 };
+        if used + w > max_cols { return &s[..i]; }
+        used += w;
+    }
+    s
+}
+
+// How many terminal columns does `s` occupy?
+fn str_cols(s: &str) -> usize {
+    s.chars().map(|c| if (c as u32) >= 0xE000 { 2 } else { 1 }).sum()
+}
+
+// Write `width` chars of ── with the title centred, active/inactive colour.
+fn write_border_title(o: &mut Out, title: &str, width: usize, active: bool) {
+    // truncate title from the left if it is too long
+    let max_t = width.saturating_sub(4); // minimum 2 dashes + 2 spaces
+    let t = if title.len() > max_t { &title[title.len() - max_t..] } else { title };
+    let inner = format!(" {} ", t);
+    let ilen  = inner.chars().count();
+    let left  = if width > ilen { (width - ilen) / 2 } else { 0 };
+    let right = width.saturating_sub(ilen + left);
+    c_norm(o);
+    for _ in 0..left  { write!(o, "═").unwrap(); }
     if active { c_hdr_act(o); } else { c_hdr(o); }
-    let title = pane.title();
-    let avail  = cols.saturating_sub(1);
-    let title  = if title.len() > avail { format!("…{}", &title[title.len()-avail+1..]) } else { title };
-    write!(o, " {:<width$}", title, width = avail.saturating_sub(1)).unwrap();
+    write!(o, "{}", inner).unwrap();
+    c_norm(o);
+    for _ in 0..right { write!(o, "═").unwrap(); }
+}
+
+fn draw_top_border(o: &mut Out, cols: usize, half: usize,
+                   left_title: &str, right_title: &str, active: usize) {
+    goto(o, 1, 1);
+    c_norm(o);
+    write!(o, "╔").unwrap();
+    write_border_title(o, left_title,  half - 1,       active == 0);
+    c_norm(o); write!(o, "╦").unwrap();
+    write_border_title(o, right_title, cols - half - 2, active == 1);
+    c_norm(o); write!(o, "╗").unwrap();
     c_reset(o);
+}
 
-    let visible = (rows as usize).saturating_sub(1);
-    let cursor  = pane.cursor();
+fn draw_bottom_border(o: &mut Out, row: u16, cols: usize, half: usize) {
+    goto(o, row, 1);
+    c_norm(o);
+    write!(o, "╚").unwrap();
+    for _ in 0..half - 1       { write!(o, "═").unwrap(); }
+    write!(o, "╩").unwrap();
+    for _ in 0..cols - half - 2 { write!(o, "═").unwrap(); }
+    write!(o, "╝").unwrap();
+    c_reset(o);
+}
 
-    // scroll
+// Draw only the content cells of one pane (no title, no borders).
+// col0 / inner_w are the inner dimensions (already excluding the │ chars).
+fn draw_pane_content(o: &mut Out, pane: &mut Pane, active: bool,
+                     row0: u16, n_rows: usize, col0: u16, inner_w: usize) {
+    let cursor = pane.cursor();
     let offset = {
         let off = pane.offset();
         if cursor < off { cursor }
-        else if cursor >= off + visible { cursor.saturating_sub(visible.saturating_sub(1)) }
+        else if cursor >= off + n_rows { cursor.saturating_sub(n_rows.saturating_sub(1)) }
         else { off }
     };
     *pane.offset_mut() = offset;
 
     let entries = pane.entries();
-    for i in 0..visible {
-        goto(o, row0 + 1 + i as u16, col0);
+    for i in 0..n_rows {
+        goto(o, row0 + i as u16, col0);
         let idx = offset + i;
         if idx >= entries.len() {
-            write!(o, "{:<width$}", "", width = cols).unwrap();
+            c_norm(o);
+            write!(o, "{:<w$}", "", w = inner_w).unwrap();
+            c_reset(o);
             continue;
         }
-        let e = &entries[idx];
-        if idx == cursor    { if active { c_sel(o); } else { c_sel_inactive(o); } }
-        else if e.is_dir    { c_dir(o); }
-        else                { c_norm(o); }
-        let line = e.display(cols);
-        write!(o, "{:<width$}", &line[..line.len().min(cols)], width = cols).unwrap();
+        let e        = &entries[idx];
+        let selected = pane.is_selected(idx);
+        if idx == cursor  { if active { c_sel(o); } else { c_sel_inactive(o); } }
+        else if selected  { c_sel_file(o); }
+        else if e.is_dir  { c_dir(o); }
+        else              { c_norm(o); }
+        let line    = e.display(inner_w);
+        let trimmed = trunc_cols(&line, inner_w);
+        let padding = inner_w.saturating_sub(str_cols(trimmed));
+        write!(o, "{}{:pad$}", trimmed, "", pad = padding).unwrap();
         c_reset(o);
     }
 }
 
-const HELP: &str =
-    " 3View  4/e:Edit  5Copy  6RenMov  7Mkdir  8/dd:Del  S:sync  C:rclone  s:sort  g:goto  r:rename  10Quit";
+// (num_str, label_with_vim_hint)
+const FKEYS: &[(&str, &str)] = &[
+    ("1",  "Help(?)"),
+    ("2",  "Rename(r)"),
+    ("3",  "View"),
+    ("4",  "Edit(e)"),
+    ("5",  "Copy"),
+    ("6",  "Move"),
+    ("7",  "Mkdir"),
+    ("8",  "Delete(dd)"),
+    ("9",  "Menu"),
+    ("10", "Quit"),
+];
 
-fn draw_status(o: &mut Out, rows: u16, cols: usize, msg: Option<&str>) {
+fn draw_fkey_bar(o: &mut Out, rows: u16, cols: usize) {
+    goto(o, rows, 1);
+    let mut used = 0usize;
+    for &(num, label) in FKEYS {
+        let entry_len = num.len() + label.len() + 1; // +1 trailing space
+        if used + entry_len > cols { break; }
+        // number: bright cyan on black  (exact NC look)
+        tc!(o, fg 0x55,0xFF,0xFF); tc!(o, bg 0x00,0x00,0x00);
+        write!(o, "{}", num).unwrap();
+        // label: black on dark cyan
+        tc!(o, fg 0x00,0x00,0x00); tc!(o, bg 0x00,0xAA,0xAA);
+        write!(o, "{} ", label).unwrap();
+        used += entry_len;
+    }
+    // fill remaining width with black
+    tc!(o, fg 0x55,0xFF,0xFF); tc!(o, bg 0x00,0x00,0x00);
+    if used < cols { write!(o, "{:width$}", "", width = cols - used).unwrap(); }
+    c_reset(o);
+}
+
+fn flash(o: &mut Out, msg: &str) {
+    let (rows, cols) = term_size();
     goto(o, rows, 1);
     c_status(o);
-    let text = msg.unwrap_or(HELP);
-    let text = &text[..text.len().min(cols)];
-    write!(o, "{:<width$}", text, width = cols).unwrap();
+    let text = &msg[..msg.len().min(cols as usize)];
+    write!(o, "{:<width$}", text, width = cols as usize).unwrap();
+    c_reset(o);
+    o.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+}
+
+fn draw_info_row(o: &mut Out, row: u16, cols: usize, _pane: &Pane) {
+    goto(o, row, 1);
+    tc!(o, bg 0x00,0x00,0x00);
+    write!(o, "{:<width$}", "", width = cols).unwrap();
     c_reset(o);
 }
 
 fn render(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
     let (rows, cols) = term_size();
-    let cols  = cols as usize;
-    let half  = cols / 2;
-    draw_pane(o, &mut panes[0], active == 0, 1, rows - 1, 1,          half);
-    draw_pane(o, &mut panes[1], active == 1, 1, rows - 1, half as u16 + 1, cols - half);
-    draw_status(o, rows, cols, None);
+    let cols = cols as usize;
+    let half = cols / 2;
+    // Layout: row 1 = top border, rows 2..rows-3 = content,
+    //         row rows-2 = bottom border, row rows-1 = black line, row rows = fkeys
+    let n_content = (rows as usize).saturating_sub(4);
+    let inner_left  = half.saturating_sub(1);          // cols between ┌ and ┬
+    let inner_right = cols.saturating_sub(half + 2);   // cols between ┬ and ┐
+
+    // get titles before splitting the mutable borrow
+    let lt = panes[0].title();
+    let rt = panes[1].title();
+
+    draw_top_border(o, cols, half, &lt, &rt, active);
+
+    // pane content (inner columns, no │ chars)
+    draw_pane_content(o, &mut panes[0], active == 0, 2, n_content, 2,                 inner_left);
+    draw_pane_content(o, &mut panes[1], active == 1, 2, n_content, half as u16 + 2,   inner_right);
+
+    // draw ║ side/middle borders over content rows (after content so colour is correct)
+    c_norm(o);
+    for r in 0..n_content as u16 {
+        goto(o, 2 + r, 1);                write!(o, "║").unwrap();
+        goto(o, 2 + r, half as u16 + 1); write!(o, "║").unwrap();
+        goto(o, 2 + r, cols as u16);     write!(o, "║").unwrap();
+    }
+    c_reset(o);
+
+    draw_bottom_border(o, rows - 2, cols, half);
+    draw_info_row(o, rows - 1, cols, &panes[active]);
+    draw_fkey_bar(o, rows, cols);
     o.flush().unwrap();
 }
 
@@ -735,12 +933,6 @@ fn prompt(o: &mut Out, label: &str, default: &str) -> Option<String> {
     }
 }
 
-fn flash(o: &mut Out, msg: &str) {
-    let (rows, cols) = term_size();
-    draw_status(o, rows, cols as usize, Some(msg));
-    o.flush().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File operations (local only; remote panes show a notice)
@@ -774,45 +966,65 @@ fn op_rename(o: &mut Out, p: &mut Pane) {
 
 fn op_copy(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     if src.is_remote() || dst.is_remote() { flash(o, " Remote copy not supported"); return; }
-    let sname  = src.current().map(|e| e.name.clone());
-    let spath  = src.as_local().unwrap().path.clone();
-    let dpath  = dst.as_local().unwrap().path.clone();
-    let Some(name) = sname else { return };
-    let Some(target) = prompt(o, "Copy to", &dpath.join(&name).display().to_string()) else { return };
+    let names: Vec<String> = if src.has_selection() { src.selected_names() }
+        else { src.current().map(|e| vec![e.name.clone()]).unwrap_or_default() };
+    if names.is_empty() { return; }
+    let spath = src.as_local().unwrap().path.clone();
+    let dpath = dst.as_local().unwrap().path.clone();
+    let default = if names.len() == 1 { dpath.join(&names[0]).display().to_string() }
+                  else { dpath.display().to_string() };
+    let Some(target) = prompt(o, "Copy to", &default) else { return };
     if target.is_empty() { return; }
-    if let Err(e) = copy_rec(&spath.join(&name), std::path::Path::new(&target)) {
-        flash(o, &format!(" Error: {}", e));
+    let dst_root = std::path::PathBuf::from(&target);
+    for name in &names {
+        let dst_p = if names.len() == 1 { dst_root.clone() } else { dst_root.join(name) };
+        if let Err(e) = copy_rec(&spath.join(name), &dst_p) { flash(o, &format!(" Error: {}", e)); }
     }
     src.refresh(); dst.refresh();
 }
 
 fn op_move(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
     if src.is_remote() || dst.is_remote() { flash(o, " Remote move not supported"); return; }
-    let sname  = src.current().map(|e| e.name.clone());
-    let spath  = src.as_local().unwrap().path.clone();
-    let dpath  = dst.as_local().unwrap().path.clone();
-    let Some(name) = sname else { return };
-    let Some(target) = prompt(o, "Move to", &dpath.join(&name).display().to_string()) else { return };
+    let names: Vec<String> = if src.has_selection() { src.selected_names() }
+        else { src.current().map(|e| vec![e.name.clone()]).unwrap_or_default() };
+    if names.is_empty() { return; }
+    let spath = src.as_local().unwrap().path.clone();
+    let dpath = dst.as_local().unwrap().path.clone();
+    let default = if names.len() == 1 { dpath.join(&names[0]).display().to_string() }
+                  else { dpath.display().to_string() };
+    let Some(target) = prompt(o, "Move to", &default) else { return };
     if target.is_empty() { return; }
-    let dst_p  = std::path::PathBuf::from(&target);
-    let src_p  = spath.join(&name);
-    let result = fs::rename(&src_p, &dst_p).or_else(|_| {
-        copy_rec(&src_p, &dst_p)?;
-        if src_p.is_dir() { fs::remove_dir_all(&src_p) } else { fs::remove_file(&src_p) }
-    });
-    if let Err(e) = result { flash(o, &format!(" Error: {}", e)); }
+    let dst_root = std::path::PathBuf::from(&target);
+    for name in &names {
+        let src_p = spath.join(name);
+        let dst_p = if names.len() == 1 { dst_root.clone() } else { dst_root.join(name) };
+        let result = fs::rename(&src_p, &dst_p).or_else(|_| {
+            copy_rec(&src_p, &dst_p)?;
+            if src_p.is_dir() { fs::remove_dir_all(&src_p) } else { fs::remove_file(&src_p) }
+        });
+        if let Err(e) = result { flash(o, &format!(" Error: {}", e)); }
+    }
     src.refresh(); dst.refresh();
 }
 
 fn op_delete(o: &mut Out, p: &mut Pane) {
     if p.is_remote() { flash(o, " Remote delete not supported"); return; }
-    let lp = p.as_local_mut().unwrap();
-    let Some(e) = lp.entries.get(lp.cursor).cloned() else { return };
-    let Some(ans) = prompt(o, &format!("Delete '{}'? [y/N]", e.name), "") else { return };
+    let names: Vec<String> = if p.has_selection() {
+        p.selected_names()
+    } else {
+        p.current().map(|e| vec![e.name.clone()]).unwrap_or_default()
+    };
+    if names.is_empty() { return; }
+    let label = if names.len() == 1 { format!("'{}'", names[0]) }
+                else { format!("{} items", names.len()) };
+    let Some(ans) = prompt(o, &format!("Delete {}? [y/N]", label), "") else { return };
     if ans.to_lowercase() != "y" { return; }
-    let path = lp.path.join(&e.name);
-    if let Err(e) = if e.is_dir { fs::remove_dir_all(&path) } else { fs::remove_file(&path) } {
-        flash(o, &format!(" Error: {}", e));
+    let lp = p.as_local_mut().unwrap();
+    for name in &names {
+        let path = lp.path.join(name);
+        if let Err(e) = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) } {
+            flash(o, &format!(" Error: {}", e));
+        }
     }
     lp.refresh();
 }
@@ -846,41 +1058,46 @@ fn op_goto(o: &mut Out, p: &mut Pane) {
 
 fn op_sort(o: &mut Out, p: &mut Pane) {
     let lp = match p { Pane::Local(lp) => lp, _ => return };
-    let items = vec!["Name".to_string(), "Size".to_string(), "Extension".to_string()];
     let current = match lp.sort { SortBy::Name => 0, SortBy::Size => 1, SortBy::Ext => 2 };
-    // temporarily borrow o for picker — rebuild items as owned Vec
+    let rev0    = lp.reverse;
     let Some(idx) = ({
-        let items_ref: Vec<String> = items;
         let mut cur = current;
+        let mut rev = rev0;
         let n = 3usize;
         loop {
             let (rows, cols) = term_size();
             let (rows, cols) = (rows as usize, cols as usize);
-            let box_w   = 24usize.min(cols.saturating_sub(4));
+            let box_w   = 28usize.min(cols.saturating_sub(4));
             let total_h = n + 2;
             let row0    = ((rows.saturating_sub(total_h)) / 2 + 1) as u16;
             let col0    = ((cols.saturating_sub(box_w))   / 2 + 1) as u16;
-            let inner_w = draw_nc_box(o, row0, col0, box_w, n, "Sort by");
+            let title   = if rev { "Sort by  ↓ desc" } else { "Sort by  ↑ asc" };
+            let inner_w = draw_nc_box(o, row0, col0, box_w, n, title);
+            let labels  = ["Name", "Size", "Extension"];
             for i in 0..n {
                 goto(o, row0 + 1 + i as u16, col0 + 1);
-                let label  = &items_ref[i];
-                let marker = if i == current { "◆ " } else { "  " };
+                let marker = if i == current { if rev { "◆↓ " } else { "◆↑ " } } else { "   " };
                 if i == cur { c_sel(o); } else { c_norm(o); }
-                let lbl = &label[..label.len().min(inner_w.saturating_sub(2))];
-                write!(o, "{}{:<w$}", marker, lbl, w = inner_w.saturating_sub(2)).unwrap();
+                let lbl = &labels[i][..labels[i].len().min(inner_w.saturating_sub(3))];
+                write!(o, "{}{:<w$}", marker, lbl, w = inner_w.saturating_sub(3)).unwrap();
                 c_reset(o);
             }
             o.flush().unwrap();
             match read_key() {
-                Key::Esc   => break None,
-                Key::Enter => break Some(cur),
+                Key::Esc              => break None,
+                Key::Enter            => break Some((cur, rev)),
+                Key::Char('r') | Key::Char('R') => rev = !rev,
                 Key::Up   if cur > 0     => cur -= 1,
                 Key::Down if cur + 1 < n => cur += 1,
                 _ => {}
             }
         }
     }) else { return };
-    lp.sort = match idx { 1 => SortBy::Size, 2 => SortBy::Ext, _ => SortBy::Name };
+    let (idx, rev) = idx;
+    let new_sort = match idx { 1 => SortBy::Size, 2 => SortBy::Ext, _ => SortBy::Name };
+    // selecting the already-active criterion also toggles direction
+    lp.reverse = if new_sort == lp.sort && rev == rev0 { !rev0 } else { rev };
+    lp.sort    = new_sort;
     lp.refresh();
 }
 
@@ -1030,9 +1247,7 @@ fn op_rclone_mount(o: &mut Out, panes: &mut [Pane; 2], mounts: &mut Vec<String>)
         flash(o, &format!(" Cannot create mountpoint: {}", e)); return;
     }
 
-    let (rows, cols) = term_size();
-    draw_status(o, rows, cols as usize, Some(&format!(" Mounting {}...", remote)));
-    o.flush().unwrap();
+    flash(o, &format!(" Mounting {}...", remote));
 
     let mut cmd = std::process::Command::new("rclone");
     cmd.args(["mount", &format!("{}:", remote), &mp, "--vfs-cache-mode", "writes"]);
@@ -1085,9 +1300,7 @@ fn op_connect_right(o: &mut Out, panes: &mut [Pane; 2]) {
     if hosts.is_empty() { flash(o, " No ~/.netrc entries found"); return; }
     let Some(idx) = picker(o, "FTP (netrc)", &hosts) else { return };
     let host = &hosts[idx];
-    let (rows, cols) = term_size();
-    draw_status(o, rows, cols as usize, Some(&format!(" Connecting to {}...", host)));
-    o.flush().unwrap();
+    flash(o, &format!(" Connecting to {}...", host));
     let (user, pass) = netrc_creds(host).unwrap_or_default();
     match Ftp::connect(host, &user, &pass) {
         Ok(ftp) => panes[1] = Pane::Remote(RemotePane::new(ftp)),
@@ -1124,39 +1337,47 @@ fn op_edit(o: &mut Out, p: &Pane) {
 }
 
 const HELP_LINES: &[&str] = &[
-    "  Navigation                         ",
-    "  ↑/↓          move cursor           ",
-    "  PgUp/PgDn    scroll page           ",
-    "  Home/End     first/last entry      ",
-    "  gg           go to top             ",
-    "  GG           go to bottom          ",
-    "  Enter/→      enter dir / open      ",
-    "  ←            go up (parent dir)    ",
-    "  Tab           switch active pane   ",
-    "                                     ",
-    "  File operations                    ",
-    "  e / F4       edit file             ",
-    "  F3           view file (pager)     ",
-    "  F5           copy to other pane    ",
-    "  F6           move to other pane    ",
-    "  F7           mkdir                 ",
-    "  dd / F8      delete                ",
-    "  r            rename                ",
-    "                                     ",
-    "  Pane / misc                        ",
-    "  S            sync other pane here  ",
-    "  g            goto path             ",
-    "  s            sort by …             ",
-    "  R            refresh               ",
-    "  C            rclone remote mount   ",
-    "  f            FTP (netrc) connect   ",
-    "  ?            this help             ",
-    "  q / F10      quit                  ",
-    "                                     ",
-    "  Mouse                              ",
-    "  click        switch pane / cursor  ",
-    "  dbl-click    enter dir / open      ",
-    "  scroll       scroll 3 rows         ",
+    "  Navigation                              ",
+    "  Tab           switch active pane        ",
+    "  ↑/↓           move cursor               ",
+    "  PgUp/PgDn     scroll page               ",
+    "  Home/End       first/last entry         ",
+    "  gg             go to top (vim)           ",
+    "  G              go to bottom (vim)        ",
+    "  /              incremental search        ",
+    "  Enter/→        enter dir or open file   ",
+    "  ←/Backspace    go up (parent dir)       ",
+    "                                          ",
+    "  Selection                               ",
+    "  Insert         toggle + move down       ",
+    "  Space          toggle selection         ",
+    "  Ctrl+A         select all               ",
+    "  Esc            deselect all             ",
+    "                                          ",
+    "  File operations                         ",
+    "  F1 / ?         this help                ",
+    "  F2 / r         rename                   ",
+    "  F3             view file (pager)        ",
+    "  F4 / e         edit file                ",
+    "  F5             copy to other pane       ",
+    "  F6             move to other pane       ",
+    "  F7             create directory         ",
+    "  F8 / dd / Del  delete                   ",
+    "  F9             context menu             ",
+    "  F10 / q        quit                     ",
+    "                                          ",
+    "  Misc                                    ",
+    "  S              sync other pane here     ",
+    "  '              goto path                 ",
+    "  s              sort by …               ",
+    "  R              refresh                  ",
+    "  C              rclone remote mount      ",
+    "  f              FTP (netrc) connect      ",
+    "                                          ",
+    "  Mouse                                   ",
+    "  click          switch pane / cursor     ",
+    "  dbl-click      enter dir or open file   ",
+    "  scroll         scroll 3 rows            ",
 ];
 
 fn op_help(o: &mut Out) {
@@ -1174,6 +1395,76 @@ fn op_help(o: &mut Out) {
     }
     o.flush().unwrap();
     read_key();
+}
+
+fn op_search(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
+    let original = panes[active].cursor();
+    let mut query = String::new();
+    show_cur(o);
+    loop {
+        render(o, panes, active);
+        let (rows, cols) = term_size();
+        // overwrite info row with the search prompt
+        goto(o, rows - 1, 1);
+        c_status(o);
+        let prompt = format!("/{}", query);
+        write!(o, "{:<width$}", prompt, width = cols as usize).unwrap();
+        c_reset(o);
+        goto(o, rows - 1, prompt.chars().count() as u16 + 1);
+        o.flush().unwrap();
+
+        match read_key() {
+            Key::Esc => {
+                *panes[active].cursor_mut() = original;
+                hide_cur(o);
+                return;
+            }
+            Key::Enter => { hide_cur(o); return; }
+            Key::Backspace => { query.pop(); }
+            Key::Char(c) if !c.is_control() => query.push(c),
+            _ => {}
+        }
+
+        if !query.is_empty() {
+            let q = query.to_lowercase();
+            if let Some(idx) = panes[active].entries().iter()
+                .position(|e| e.name.to_lowercase().contains(&q))
+            {
+                *panes[active].cursor_mut() = idx;
+            }
+        }
+    }
+}
+
+fn op_context_menu(o: &mut Out, panes: &mut [Pane; 2], active: usize, mounts: &mut Vec<String>) {
+    let items: Vec<String> = vec![
+        "View (F3)".into(), "Edit (F4/e)".into(), "Copy (F5)".into(),
+        "Move (F6)".into(), "Rename (F2/r)".into(), "Mkdir (F7)".into(),
+        "Delete (F8/dd)".into(), "Select All (Ctrl+A)".into(),
+        "Deselect All (Esc)".into(), "Sort…(s)".into(),
+        "Go to…(g)".into(), "Sync panes (S)".into(),
+        "rclone mount (C)".into(), "FTP connect (f)".into(),
+        "Refresh (R)".into(),
+    ];
+    let Some(idx) = picker(o, "Menu", &items) else { return };
+    match idx {
+        0  => { let (a, _) = split(panes, active); op_view(o, a); }
+        1  => { let (a, _) = split(panes, active); op_edit(o, a); }
+        2  => { let (a, b) = split(panes, active); op_copy(o, a, b); }
+        3  => { let (a, b) = split(panes, active); op_move(o, a, b); }
+        4  => { let (a, _) = split(panes, active); op_rename(o, a); }
+        5  => { let (a, _) = split(panes, active); op_mkdir(o, a); }
+        6  => { let (a, _) = split(panes, active); op_delete(o, a); }
+        7  => panes[active].select_all(),
+        8  => panes[active].clear_sel(),
+        9  => { let (a, _) = split(panes, active); op_sort(o, a); }
+        10 => { let (a, _) = split(panes, active); op_goto(o, a); }
+        11 => op_sync_panes(panes, active),
+        12 => op_rclone_mount(o, panes, mounts),
+        13 => op_connect_right(o, panes),
+        14 => panes[active].refresh(),
+        _  => {}
+    }
 }
 
 fn op_sync_panes(panes: &mut [Pane; 2], active: usize) {
@@ -1235,25 +1526,22 @@ fn main() {
     loop {
         render(&mut o, &mut panes, active);
         let (rows, cols) = term_size();
-        let visible = rows as usize - 2;
+        let visible = rows as usize - 4; // top border + content + bottom border + black + fkeys
         let half    = (cols / 2) as u16;
 
         let key = read_key();
         let key_char = if let Key::Char(c) = key { c } else { '\0' };
         match key {
-            Key::Char('q') | Key::Char('Q') => break,
             Key::Char('\t') => active ^= 1,
 
-            Key::Up => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(1); }
-            Key::Down => {
+            // ── Navigation ──────────────────────────────────────────────────
+            Key::Up       => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(1); }
+            Key::Down     => {
                 let len = panes[active].entries().len();
                 let c   = panes[active].cursor_mut();
                 if *c + 1 < len { *c += 1; }
             }
-            Key::PageUp => {
-                let c = panes[active].cursor_mut();
-                *c = c.saturating_sub(visible);
-            }
+            Key::PageUp   => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(visible); }
             Key::PageDown => {
                 let len = panes[active].entries().len();
                 let c   = panes[active].cursor_mut();
@@ -1264,37 +1552,58 @@ fn main() {
                 let last = panes[active].entries().len().saturating_sub(1);
                 *panes[active].cursor_mut() = last;
             }
-
             Key::Enter | Key::Right => panes[active].enter(),
-            Key::Left               => panes[active].back(),
+            Key::Left | Key::Backspace => panes[active].back(),
 
-            // MC function keys
+            // ── Selection ───────────────────────────────────────────────────
+            Key::Insert => {
+                let idx = panes[active].cursor();
+                panes[active].toggle_sel(idx);
+                let len = panes[active].entries().len();
+                let c   = panes[active].cursor_mut();
+                if *c + 1 < len { *c += 1; }
+            }
+            Key::Char(' ') => {
+                let idx = panes[active].cursor();
+                panes[active].toggle_sel(idx);
+            }
+            Key::Char('\x01') => panes[active].select_all(),    // Ctrl+A
+            Key::Esc          => panes[active].clear_sel(),
+            Key::Delete       => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
+
+            // ── F-keys (NC layout) ──────────────────────────────────────────
+            Key::F(1)  => op_help(&mut o),
+            Key::F(2)  => { let (a, _) = split(&mut panes, active); op_rename(&mut o, a); }
             Key::F(3)  => { let (a, _) = split(&mut panes, active); op_view(&mut o, a); }
             Key::F(4)  => { let (a, _) = split(&mut panes, active); op_edit(&mut o, a); }
             Key::F(5)  => { let (a, b) = split(&mut panes, active); op_copy(&mut o, a, b); }
             Key::F(6)  => { let (a, b) = split(&mut panes, active); op_move(&mut o, a, b); }
             Key::F(7)  => { let (a, _) = split(&mut panes, active); op_mkdir(&mut o, a); }
             Key::F(8)  => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
+            Key::F(9)  => op_context_menu(&mut o, &mut panes, active, &mut mounts),
             Key::F(10) => break,
 
-            // letter bindings
+            // ── Vim-style letter bindings ───────────────────────────────────
+            Key::Char('/') => op_search(&mut o, &mut panes, active),
             Key::Char('e') => { let (a, _) = split(&mut panes, active); op_edit(&mut o, a); }
             Key::Char('d') if last_char == 'd' => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
             Key::Char('g') if last_char == 'g' => { *panes[active].cursor_mut() = 0; }
-            Key::Char('G') if last_char == 'G' => {
+            Key::Char('G') => {
                 let last = panes[active].entries().len().saturating_sub(1);
                 *panes[active].cursor_mut() = last;
             }
+            Key::Char('g') => { /* first half of gg — wait for second g */ }
+            Key::Char('\'') => { let (a, _) = split(&mut panes, active); op_goto(&mut o, a); }
             Key::Char('r') => { let (a, _) = split(&mut panes, active); op_rename(&mut o, a); }
-            Key::Char('g') => { let (a, _) = split(&mut panes, active); op_goto(&mut o, a); }
             Key::Char('s') => { let (a, _) = split(&mut panes, active); op_sort(&mut o, a); }
             Key::Char('S') => op_sync_panes(&mut panes, active),
             Key::Char('C') => op_rclone_mount(&mut o, &mut panes, &mut mounts),
             Key::Char('f') => op_connect_right(&mut o, &mut panes),
             Key::Char('R') => panes[active].refresh(),
             Key::Char('?') => op_help(&mut o),
+            Key::Char('q') | Key::Char('Q') => break,
 
-            // mouse
+            // ── Mouse ────────────────────────────────────────────────────────
             Key::Click { btn: 0, col, row } => {
                 let clicked = if col <= half { 0usize } else { 1usize };
                 if row >= 2 {
@@ -1306,12 +1615,13 @@ fn main() {
                             active = clicked;
                             *panes[clicked].cursor_mut() = idx;
                         }
-                    } else {
-                        active = clicked;
-                    }
-                } else {
-                    active = clicked;
-                }
+                    } else { active = clicked; }
+                } else { active = clicked; }
+            }
+            Key::Click { btn: 2, col, .. } => {
+                let clicked = if col <= half { 0usize } else { 1usize };
+                active = clicked;
+                panes[active].back();
             }
             Key::Scroll { up, col, .. } => {
                 let p = if col <= half { 0usize } else { 1usize };
