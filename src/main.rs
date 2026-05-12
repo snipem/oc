@@ -752,6 +752,76 @@ fn render(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
 // Input prompt — raw mode, ESC aborts (None), Enter confirms (Some)
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn prompt_path(o: &mut Out, label: &str, default: &str) -> Option<String> {
+    let mut buf: Vec<char> = default.chars().collect();
+    let mut completions: Vec<String> = vec![];
+    let mut comp_idx: Option<usize> = None;
+    show_cur(o);
+    loop {
+        let (rows, cols) = term_size();
+        let header = format!(" {}: ", label);
+        let avail  = (cols as usize).saturating_sub(header.len() + 1);
+        goto(o, rows, 1);
+        c_status(o);
+        let display: String = buf.iter().collect();
+        let dlen = display.chars().count();
+        let disp_start = if dlen > avail { dlen - avail } else { 0 };
+        let disp: String = display.chars().skip(disp_start).collect();
+        write!(o, "{}{:<width$}", header, disp, width = avail).unwrap();
+        goto(o, rows, (header.len() + disp.chars().count() + 1).min(cols as usize) as u16);
+        o.flush().unwrap();
+
+        match read_key() {
+            Key::Esc       => { hide_cur(o); return None; }
+            Key::Enter     => { hide_cur(o); return Some(buf.iter().collect()); }
+            Key::Backspace => { buf.pop(); comp_idx = None; completions.clear(); }
+            Key::Char('\t') => {
+                let s: String = buf.iter().collect();
+                // split path into dir and partial name
+                let (dir, pfx) = if s.ends_with('/') || s.is_empty() {
+                    (if s.is_empty() { "." } else { s.trim_end_matches('/') }, "")
+                } else {
+                    let p = std::path::Path::new(&s);
+                    (p.parent().and_then(|d| d.to_str()).unwrap_or("."),
+                     p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+                };
+                if comp_idx.is_none() {
+                    completions = fs::read_dir(dir).map(|rd| {
+                        let mut v: Vec<String> = rd.flatten()
+                            .filter(|e| e.path().is_dir())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .filter(|n| n.starts_with(pfx))
+                            .map(|n| {
+                                let base = dir.trim_end_matches('/');
+                                if base.is_empty() || base == "." && !s.starts_with('.') {
+                                    format!("{}/", n)
+                                } else {
+                                    format!("{}/{}/", base, n)
+                                }
+                            })
+                            .collect();
+                        v.sort();
+                        v
+                    }).unwrap_or_default();
+                    comp_idx = Some(0);
+                } else {
+                    let n = completions.len();
+                    if n > 0 { comp_idx = Some((comp_idx.unwrap() + 1) % n); }
+                }
+                if let Some(idx) = comp_idx {
+                    if let Some(c) = completions.get(idx) {
+                        buf = c.chars().collect();
+                    }
+                }
+            }
+            Key::Char(c) if !c.is_control() => {
+                buf.push(c); comp_idx = None; completions.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
 fn prompt(o: &mut Out, label: &str, default: &str) -> Option<String> {
     let mut buf: Vec<char> = default.chars().collect();
     show_cur(o);
@@ -1039,7 +1109,7 @@ fn op_mkdir(o: &mut Out, p: &mut Pane) {
 fn op_goto(o: &mut Out, p: &mut Pane) {
     let lp   = p.as_local_mut();
     let curr = lp.path.display().to_string();
-    let Some(tgt) = prompt(o, "Go to", &curr) else { return };
+    let Some(tgt) = prompt_path(o, "Go to", &curr) else { return };
     if tgt.is_empty() { return; }
     let path = std::path::PathBuf::from(&tgt);
     if path.is_dir() {
@@ -1376,7 +1446,7 @@ const HELP_LEFT: &[(&str, &str)] = &[
     ("",                  ""),
     ("Selection",         ""),
     ("Insert",            "toggle selection + move down"),
-    ("Space",             "toggle selection"),
+    ("Space",             "search"),
     ("Ctrl+A",            "select all"),
     ("Esc",               "deselect all"),
     ("",                  ""),
@@ -1588,13 +1658,13 @@ fn print_help() {
     println!("  PgUp / PgDn           page up / down");
     println!("  Home / End            first / last entry");
     println!("  gg / G                top / bottom");
-    println!("  / query               incremental search");
+    println!("  Space / /             incremental search (Tab to complete in goto)");
     println!("  n / N                 next / prev match");
     println!("  Enter / →             enter dir or open file");
     println!("  ← / Backspace         parent directory\n");
     println!("Selection");
     println!("  Insert                toggle selection + move down");
-    println!("  Space                 toggle selection");
+    println!("  Space / /             incremental search");
     println!("  Ctrl+A                select all");
     println!("  Esc                   deselect all\n");
     println!("File Operations");
@@ -1766,10 +1836,7 @@ fn main() {
                 let c   = panes[active].cursor_mut();
                 if *c + 1 < len { *c += 1; }
             }
-            Key::Char(' ') => {
-                let idx = panes[active].cursor();
-                panes[active].toggle_sel(idx);
-            }
+            Key::Char(' ') => { if let Some(q) = op_search(&mut o, &mut panes, active) { last_query = q; } }
             Key::Char('\x01') => panes[active].select_all(),    // Ctrl+A
             Key::Esc          => { panes[active].exit_marker_mode(); panes[active].clear_sel(); }
             Key::Delete       => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }

@@ -31,7 +31,7 @@ Usable two-pane terminal file manager. Zero external dependencies. Static musl b
 | `PgUp` / `PgDn` | Page up / down |
 | `Home` / `End` | First / last entry |
 | `gg` / `G` | Top / bottom |
-| `/` | Incremental search (UTF-8) |
+| `Space` / `/` | Incremental search (UTF-8) |
 | `n` / `N` | Next / prev match |
 | `Enter` / `→` | Enter directory or open file |
 | `←` / `Backspace` | Parent directory |
@@ -66,7 +66,7 @@ Usable two-pane terminal file manager. Zero external dependencies. Static musl b
 | Key | Action |
 |-----|--------|
 | `S` | Sync panes (copy path to other) |
-| `#` | Go to path |
+| `#` | Go to path (Tab to cycle matching subdirs) |
 | `s` | Sort by name / size / extension |
 | `R` | Refresh |
 | `C` | rclone remote mount |
