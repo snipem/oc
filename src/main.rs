@@ -1452,6 +1452,7 @@ const HELP_LINES: &[&str] = &[
     "  gg             go to top (vim)           ",
     "  G              go to bottom (vim)        ",
     "  /              incremental search        ",
+  "  n / N          next / prev match        ",
     "  Enter/→        enter dir or open file   ",
     "  ←/Backspace    go up (parent dir)       ",
     "                                          ",
@@ -1504,14 +1505,28 @@ fn op_help(o: &mut Out) {
     read_key();
 }
 
-fn op_search(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
+fn search_jump(panes: &mut [Pane; 2], active: usize, query: &str, forward: bool) {
+    if query.is_empty() { return; }
+    let q = query.to_lowercase();
+    let n = panes[active].entries().len();
+    if n == 0 { return; }
+    let from = panes[active].cursor();
+    for i in 1..=n {
+        let idx = if forward { (from + i) % n } else { (from + n - i) % n };
+        if panes[active].entries()[idx].name.to_lowercase().contains(&q) {
+            *panes[active].cursor_mut() = idx;
+            return;
+        }
+    }
+}
+
+fn op_search(o: &mut Out, panes: &mut [Pane; 2], active: usize) -> Option<String> {
     let original = panes[active].cursor();
     let mut query = String::new();
     show_cur(o);
     loop {
         render(o, panes, active);
         let (rows, cols) = term_size();
-        // overwrite info row with the search prompt
         goto(o, rows - 1, 1);
         c_status(o);
         let prompt = format!("/{}", query);
@@ -1524,20 +1539,24 @@ fn op_search(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
             Key::Esc => {
                 *panes[active].cursor_mut() = original;
                 hide_cur(o);
-                return;
+                return None;
             }
-            Key::Enter => { hide_cur(o); return; }
+            Key::Enter => { hide_cur(o); return Some(query); }
             Key::Backspace => { query.pop(); }
             Key::Char(c) if !c.is_control() => query.push(c),
             _ => {}
         }
 
+        // find first match at or after original cursor position
         if !query.is_empty() {
             let q = query.to_lowercase();
-            if let Some(idx) = panes[active].entries().iter()
-                .position(|e| e.name.to_lowercase().contains(&q))
-            {
-                *panes[active].cursor_mut() = idx;
+            let n = panes[active].entries().len();
+            for i in 0..n {
+                let idx = (original + i) % n;
+                if panes[active].entries()[idx].name.to_lowercase().contains(&q) {
+                    *panes[active].cursor_mut() = idx;
+                    break;
+                }
             }
         }
     }
@@ -1623,6 +1642,7 @@ fn main() {
     let mut panes  = [make_pane(left), make_pane(right)];
     let mut active = 0usize;
     let mut mounts: Vec<String> = Vec::new();
+    let mut last_query = String::new();
 
     hide_cur(&mut o);
     mouse_on(&mut o);
@@ -1698,7 +1718,9 @@ fn main() {
                 if *c + 1 < len { *c += 1; }
             }
             Key::Char('k') => { let c = panes[active].cursor_mut(); *c = c.saturating_sub(1); }
-            Key::Char('/') => op_search(&mut o, &mut panes, active),
+            Key::Char('/') => { if let Some(q) = op_search(&mut o, &mut panes, active) { last_query = q; } }
+            Key::Char('n') => search_jump(&mut panes, active, &last_query, true),
+            Key::Char('N') => search_jump(&mut panes, active, &last_query, false),
             Key::Char('e') => { let (a, _) = split(&mut panes, active); op_edit(&mut o, a); }
             Key::Char('d') if last_char == 'd' => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
             Key::Char('g') if last_char == 'g' => { *panes[active].cursor_mut() = 0; }
