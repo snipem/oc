@@ -2,6 +2,8 @@
 
 Usable two-pane terminal file manager. Zero external dependencies. Static musl binary.
 
+![Screenshot](res/screenshot.png)
+
 ## Features
 
 - Two-pane layout with independent navigation
