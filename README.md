@@ -66,7 +66,7 @@ Usable two-pane terminal file manager. Zero external dependencies. Static musl b
 | Key | Action |
 |-----|--------|
 | `S` | Sync panes (copy path to other) |
-| `'` | Go to path |
+| `#` | Go to path |
 | `s` | Sort by name / size / extension |
 | `R` | Refresh |
 | `C` | rclone remote mount |

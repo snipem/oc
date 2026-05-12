@@ -7,7 +7,7 @@
 //!   Tab      switch pane          ↑↓/PgUp PgDn/Home End  navigate
 //!   Enter/→  enter directory      ←  back
 //!   r  rename    F5 copy          F6 move
-//!   dd delete    F7 mkdir         '  goto path
+//!   dd delete    F7 mkdir         #  goto path
 //!   C  rclone mount               q  quit
 
 #![allow(clippy::all)]
@@ -979,7 +979,30 @@ fn trash_file(path: &std::path::Path) -> std::io::Result<()> {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     fs::write(t_info.join(format!("{}.trashinfo", name)),
               format!("[Trash Info]\nPath={}\nDeletionDate={}\n", abs.display(), now_iso8601()))?;
-    fs::rename(path, t_files.join(&name))
+    let dest = t_files.join(&name);
+    fs::rename(path, &dest).or_else(|e| {
+        if e.raw_os_error() != Some(18) { return Err(e); } // 18 = EXDEV
+        // cross-device: copy then remove original
+        if path.is_dir() {
+            copy_rec_plain(path, &dest)?;
+            fs::remove_dir_all(path)
+        } else {
+            fs::copy(path, &dest)?;
+            fs::remove_file(path)
+        }
+    })
+}
+
+fn copy_rec_plain(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)?.flatten() {
+            copy_rec_plain(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
 }
 
 fn op_delete(o: &mut Out, p: &mut Pane) {
@@ -1379,7 +1402,7 @@ const HELP_RIGHT: &[(&str, &str)] = &[
     ("",                  ""),
     ("Misc",              ""),
     ("S",                 "sync panes (copy path to other)"),
-    ("'",                 "go to path"),
+    ("#",                 "go to path"),
     ("s",                 "sort by name / size / extension"),
     ("R",                 "refresh"),
     ("C",                 "rclone remote mount"),
@@ -1587,7 +1610,7 @@ fn print_help() {
     println!("  F10 / q               quit\n");
     println!("Misc");
     println!("  S                     sync panes");
-    println!("  '                     go to path");
+    println!("  #                     go to path");
     println!("  s                     sort");
     println!("  R                     refresh");
     println!("  C                     rclone remote mount\n");
@@ -1793,7 +1816,7 @@ fn main() {
                 panes[active].sync_marker();
             }
             Key::Char('g') => { /* first half of gg — wait for second g */ }
-            Key::Char('\'') => { let (a, _) = split(&mut panes, active); op_goto(&mut o, a); }
+            Key::Char('#') => { let (a, _) = split(&mut panes, active); op_goto(&mut o, a); }
             Key::Char('r') => { let (a, _) = split(&mut panes, active); op_rename(&mut o, a); }
             Key::Char('s') => { let (a, _) = split(&mut panes, active); op_sort(&mut o, a); }
             Key::Char('S') => op_sync_panes(&mut panes, active),
