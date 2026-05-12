@@ -2,20 +2,18 @@
 //! zero external crates; terminal I/O via x86-64 inline syscalls
 //!
 //! Usage: oc [left] [right]
-//!   left/right: local path | ftp://host | bare host (resolved via ~/.netrc)
 //!
 //! Keys
 //!   Tab      switch pane          ↑↓/PgUp PgDn/Home End  navigate
 //!   Enter/→  enter directory      ←  back
-//!   r  rename    c  copy→other    m  move→other
-//!   d  delete    n  mkdir         g  goto path
-//!   C  connect (netrc FTP)        q  quit
+//!   r  rename    F5 copy          F6 move
+//!   dd delete    F7 mkdir         '  goto path
+//!   C  rclone mount               q  quit
 
 #![allow(clippy::all)]
 
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::net::TcpStream;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -314,145 +312,6 @@ fn mouse_on(o: &mut Out)  { write!(o, "\x1b[?1000h\x1b[?1006h").unwrap(); o.flus
 fn mouse_off(o: &mut Out) { write!(o, "\x1b[?1006l\x1b[?1000l").unwrap(); o.flush().unwrap(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Netrc parser
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Default)]
-struct NetrcEntry { machine: String, login: String, password: String }
-
-fn load_netrc() -> Vec<NetrcEntry> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let text  = fs::read_to_string(format!("{}/.netrc", home)).unwrap_or_default();
-    let mut out: Vec<NetrcEntry> = Vec::new();
-    let mut cur = NetrcEntry::default();
-    let mut state: u8 = 0; // 0=key, 1=machine, 2=login, 3=password
-    let mut in_entry = false;
-
-    for tok in text.split_ascii_whitespace() {
-        if state != 0 {
-            match state {
-                1 => { cur.machine  = tok.into(); }
-                2 => { cur.login    = tok.into(); }
-                3 => { cur.password = tok.into(); }
-                _ => {}
-            }
-            state = 0;
-            continue;
-        }
-        match tok {
-            "machine" | "default" => {
-                if in_entry { out.push(cur.clone()); }
-                cur = NetrcEntry::default();
-                if tok == "default" { cur.machine = "*".into(); } else { state = 1; }
-                in_entry = true;
-            }
-            "login"    => state = 2,
-            "password" => state = 3,
-            _ => {}
-        }
-    }
-    if in_entry { out.push(cur); }
-    out
-}
-
-fn netrc_creds(host: &str) -> Option<(String, String)> {
-    load_netrc().into_iter()
-        .find(|e| e.machine == host || e.machine == "*")
-        .map(|e| (e.login, e.password))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FTP client — stdlib TcpStream, no crates
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct Ftp { ctrl: BufReader<TcpStream>, host: String }
-
-impl Ftp {
-    fn connect(host: &str, user: &str, pass: &str) -> Result<Self, String> {
-        let addr = if host.contains(':') { host.to_string() } else { format!("{}:21", host) };
-        let s = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
-        let mut f = Ftp { ctrl: BufReader::new(s), host: host.to_string() };
-        f.expect(220)?;
-        f.cmd(&format!("USER {}", user))?; f.expect(331)?;
-        f.cmd(&format!("PASS {}", pass))?; f.expect(230)?;
-        Ok(f)
-    }
-
-    fn cmd(&mut self, c: &str) -> Result<(), String> {
-        write!(self.ctrl.get_mut(), "{}\r\n", c).map_err(|e| e.to_string())
-    }
-
-    fn response(&mut self) -> Result<(u16, String), String> {
-        let mut line = String::new();
-        self.ctrl.read_line(&mut line).map_err(|e| e.to_string())?;
-        let line = line.trim_end().to_string();
-        let code: u16 = line.get(..3).unwrap_or("0").parse().unwrap_or(0);
-        if line.get(3..4) == Some("-") {
-            let marker = format!("{} ", code);
-            loop {
-                let mut l = String::new();
-                self.ctrl.read_line(&mut l).map_err(|e| e.to_string())?;
-                if l.starts_with(&marker) { break; }
-            }
-        }
-        Ok((code, line))
-    }
-
-    fn expect(&mut self, code: u16) -> Result<String, String> {
-        let (c, msg) = self.response()?;
-        if c == code { Ok(msg) } else { Err(format!("got {} expected {}: {}", c, code, msg)) }
-    }
-
-    fn pasv_addr(&mut self) -> Result<String, String> {
-        self.cmd("PASV")?;
-        let msg = self.expect(227)?;
-        let s = msg.find('(').ok_or("no (")?;
-        let e = msg.find(')').ok_or("no )")?;
-        let n: Vec<u8> = msg[s+1..e].split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        if n.len() < 6 { return Err("bad PASV".into()); }
-        Ok(format!("{}.{}.{}.{}:{}", n[0], n[1], n[2], n[3], (n[4] as u16)*256 + n[5] as u16))
-    }
-
-    fn list(&mut self) -> Vec<FtpEntry> {
-        let addr = self.pasv_addr().unwrap_or_default();
-        if self.cmd("LIST").is_err() { return vec![]; }
-        let conn = match TcpStream::connect(&addr) { Ok(s) => s, Err(_) => return vec![] };
-        let _ = self.expect(150);
-        let mut v: Vec<FtpEntry> = BufReader::new(conn).lines().flatten()
-            .filter_map(|l| parse_ls(&l)).collect();
-        let _ = self.expect(226);
-        v.sort_by(|a, b| (!a.is_dir).cmp(&(!b.is_dir)).then(a.name.cmp(&b.name)));
-        v
-    }
-
-    fn cwd(&mut self, d: &str) -> bool {
-        self.cmd(&format!("CWD {}", d)).is_ok() && self.expect(250).is_ok()
-    }
-    fn cdup(&mut self) -> bool {
-        self.cmd("CDUP").is_ok() && self.expect(250).is_ok()
-    }
-    fn pwd(&mut self) -> String {
-        if self.cmd("PWD").is_err() { return "/".into(); }
-        let msg = self.expect(257).unwrap_or_default();
-        if let (Some(s), Some(e)) = (msg.find('"'), msg.rfind('"')) {
-            if s < e { return msg[s+1..e].to_string(); }
-        }
-        "/".into()
-    }
-}
-
-#[derive(Clone)]
-struct FtpEntry { name: String, is_dir: bool, size: u64 }
-
-fn parse_ls(line: &str) -> Option<FtpEntry> {
-    let parts: Vec<&str> = line.split_ascii_whitespace().collect();
-    if parts.len() < 9 { return None; }
-    let name = parts[8..].join(" ");
-    if name == "." || name == ".." { return None; }
-    Some(FtpEntry { name, is_dir: line.starts_with('d'), size: parts[4].parse().unwrap_or(0) })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Nerd Font file icons
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -550,48 +409,39 @@ impl FileEntry {
     }
 }
 
-enum Pane {
-    Local(LocalPane),
-    Remote(RemotePane),
-}
+enum Pane { Local(LocalPane) }
 
 impl Pane {
-    fn entries(&self)        -> &[FileEntry]  { match self { Pane::Local(p)  => &p.entries, Pane::Remote(p) => &p.entries } }
-    fn cursor(&self)         -> usize         { match self { Pane::Local(p)  => p.cursor,   Pane::Remote(p) => p.cursor } }
-    fn cursor_mut(&mut self) -> &mut usize    { match self { Pane::Local(p)  => &mut p.cursor, Pane::Remote(p) => &mut p.cursor } }
-    fn offset(&self)         -> usize         { match self { Pane::Local(p)  => p.offset,   Pane::Remote(p) => p.offset } }
-    fn offset_mut(&mut self) -> &mut usize    { match self { Pane::Local(p)  => &mut p.offset, Pane::Remote(p) => &mut p.offset } }
-    fn title(&mut self)      -> String        { match self { Pane::Local(p)  => p.title(),  Pane::Remote(p) => p.title() } }
-    fn refresh(&mut self)                     { match self { Pane::Local(p)  => p.refresh(), Pane::Remote(p) => p.refresh() } }
-    fn enter(&mut self)                       { match self { Pane::Local(p)  => p.enter(),  Pane::Remote(p) => p.enter() } }
-    fn back(&mut self)                        { match self { Pane::Local(p)  => p.back(),   Pane::Remote(p) => p.back() } }
-    fn is_remote(&self) -> bool               { matches!(self, Pane::Remote(_)) }
-    fn current(&self)    -> Option<&FileEntry> { self.entries().get(self.cursor()) }
-    fn as_local(&self)   -> Option<&LocalPane> { if let Pane::Local(p)  = self { Some(p) } else { None } }
-    fn as_local_mut(&mut self) -> Option<&mut LocalPane> { if let Pane::Local(p) = self { Some(p) } else { None } }
+    fn entries(&self)        -> &[FileEntry]       { let Pane::Local(p) = self; &p.entries }
+    fn cursor(&self)         -> usize              { let Pane::Local(p) = self; p.cursor }
+    fn cursor_mut(&mut self) -> &mut usize         { let Pane::Local(p) = self; &mut p.cursor }
+    fn offset(&self)         -> usize              { let Pane::Local(p) = self; p.offset }
+    fn offset_mut(&mut self) -> &mut usize         { let Pane::Local(p) = self; &mut p.offset }
+    fn title(&mut self)      -> String             { let Pane::Local(p) = self; p.title() }
+    fn refresh(&mut self)                          { let Pane::Local(p) = self; p.refresh() }
+    fn enter(&mut self)                            { let Pane::Local(p) = self; p.enter() }
+    fn back(&mut self)                             { let Pane::Local(p) = self; p.back() }
+    fn current(&self)        -> Option<&FileEntry> { self.entries().get(self.cursor()) }
+    fn as_local(&self)       -> &LocalPane         { let Pane::Local(p) = self; p }
+    fn as_local_mut(&mut self) -> &mut LocalPane   { let Pane::Local(p) = self; p }
 
     fn is_selected(&self, idx: usize) -> bool {
-        match self { Pane::Local(p) => p.selected.contains(&idx), Pane::Remote(p) => p.selected.contains(&idx) }
+        let Pane::Local(p) = self; p.selected.contains(&idx)
     }
     fn toggle_sel(&mut self, idx: usize) {
-        let sel = match self { Pane::Local(p) => &mut p.selected, Pane::Remote(p) => &mut p.selected };
-        if !sel.insert(idx) { sel.remove(&idx); }
+        let Pane::Local(p) = self;
+        if !p.selected.insert(idx) { p.selected.remove(&idx); }
     }
     fn select_all(&mut self) {
         let n = self.entries().len();
-        let sel = match self { Pane::Local(p) => &mut p.selected, Pane::Remote(p) => &mut p.selected };
-        *sel = (0..n).collect();
+        let Pane::Local(p) = self; p.selected = (0..n).collect();
     }
-    fn clear_sel(&mut self) {
-        match self { Pane::Local(p) => p.selected.clear(), Pane::Remote(p) => p.selected.clear() }
-    }
-    fn has_selection(&self) -> bool {
-        match self { Pane::Local(p) => !p.selected.is_empty(), Pane::Remote(p) => !p.selected.is_empty() }
-    }
+    fn clear_sel(&mut self)      { let Pane::Local(p) = self; p.selected.clear() }
+    fn has_selection(&self) -> bool { let Pane::Local(p) = self; !p.selected.is_empty() }
     fn selected_names(&self) -> Vec<String> {
-        let sel = match self { Pane::Local(p) => &p.selected, Pane::Remote(p) => &p.selected };
-        sel.iter()
-            .filter_map(|&i| self.entries().get(i))
+        let Pane::Local(p) = self;
+        p.selected.iter()
+            .filter_map(|&i| p.entries.get(i))
             .filter(|e| e.name != "..")
             .map(|e| e.name.clone())
             .collect()
@@ -681,53 +531,6 @@ impl LocalPane {
     }
 
     fn title(&self) -> String { self.path.display().to_string() }
-}
-
-struct RemotePane {
-    ftp:      Ftp,
-    entries:  Vec<FileEntry>,
-    cursor:   usize,
-    offset:   usize,
-    pwd:      String,
-    selected: std::collections::BTreeSet<usize>,
-}
-
-impl RemotePane {
-    fn new(mut ftp: Ftp) -> Self {
-        let pwd = ftp.pwd();
-        let entries = ftp.list().into_iter().map(|e| FileEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect();
-        RemotePane { ftp, entries, cursor: 0, offset: 0, pwd, selected: std::collections::BTreeSet::new() }
-    }
-
-    fn refresh(&mut self) {
-        self.pwd      = self.ftp.pwd();
-        self.entries  = self.ftp.list().into_iter()
-            .map(|e| FileEntry { name: e.name, is_dir: e.is_dir, size: e.size }).collect();
-        self.cursor   = self.cursor.min(self.entries.len().saturating_sub(1));
-        self.selected.clear();
-    }
-
-    fn enter(&mut self) {
-        if let Some(e) = self.entries.get(self.cursor).cloned() {
-            if e.is_dir && self.ftp.cwd(&e.name) {
-                self.cursor = 0; self.offset = 0;
-                self.refresh();
-            }
-        }
-    }
-
-    fn back(&mut self) {
-        let old = self.pwd.trim_end_matches('/').split('/').last().map(str::to_string);
-        if self.ftp.cdup() {
-            self.cursor = 0; self.offset = 0;
-            self.refresh();
-            if let Some(name) = old {
-                if let Some(i) = self.entries.iter().position(|e| e.name == name) { self.cursor = i; }
-            }
-        }
-    }
-
-    fn title(&self) -> String { format!("ftp://{}{}", self.ftp.host, self.pwd) }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -946,7 +749,7 @@ fn prompt(o: &mut Out, label: &str, default: &str) -> Option<String> {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// File operations (local only; remote panes show a notice)
+// File operations
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -1047,8 +850,7 @@ fn copy_rec(o: &mut Out, src: &std::path::Path, dst: &std::path::Path,
 }
 
 fn op_rename(o: &mut Out, p: &mut Pane) {
-    if p.is_remote() { flash(o, " Remote rename not supported"); return; }
-    let lp = p.as_local_mut().unwrap();
+    let lp = p.as_local_mut();
     let Some(e) = lp.entries.get(lp.cursor).cloned() else { return };
     if e.name == ".." { return; }
     let Some(new) = prompt(o, "Rename to", &e.name) else { return };
@@ -1060,12 +862,11 @@ fn op_rename(o: &mut Out, p: &mut Pane) {
 }
 
 fn op_copy(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
-    if src.is_remote() || dst.is_remote() { flash(o, " Remote copy not supported"); return; }
     let names: Vec<String> = if src.has_selection() { src.selected_names() }
         else { src.current().filter(|e| e.name != "..").map(|e| vec![e.name.clone()]).unwrap_or_default() };
     if names.is_empty() { return; }
-    let spath = src.as_local().unwrap().path.clone();
-    let dpath = dst.as_local().unwrap().path.clone();
+    let spath = src.as_local().path.clone();
+    let dpath = dst.as_local().path.clone();
     let default = if names.len() == 1 { dpath.join(&names[0]).display().to_string() }
                   else { dpath.display().to_string() };
     let Some(target) = prompt(o, "Copy to", &default) else { return };
@@ -1086,12 +887,11 @@ fn op_copy(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
 }
 
 fn op_move(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
-    if src.is_remote() || dst.is_remote() { flash(o, " Remote move not supported"); return; }
     let names: Vec<String> = if src.has_selection() { src.selected_names() }
         else { src.current().filter(|e| e.name != "..").map(|e| vec![e.name.clone()]).unwrap_or_default() };
     if names.is_empty() { return; }
-    let spath = src.as_local().unwrap().path.clone();
-    let dpath = dst.as_local().unwrap().path.clone();
+    let spath = src.as_local().path.clone();
+    let dpath = dst.as_local().path.clone();
     let default = if names.len() == 1 { dpath.join(&names[0]).display().to_string() }
                   else { dpath.display().to_string() };
     let Some(target) = prompt(o, "Move to", &default) else { return };
@@ -1115,7 +915,6 @@ fn op_move(o: &mut Out, src: &mut Pane, dst: &mut Pane) {
 }
 
 fn op_delete(o: &mut Out, p: &mut Pane) {
-    if p.is_remote() { flash(o, " Remote delete not supported"); return; }
     let names: Vec<String> = if p.has_selection() {
         p.selected_names()
     } else {
@@ -1126,7 +925,7 @@ fn op_delete(o: &mut Out, p: &mut Pane) {
                 else { format!("{} items", names.len()) };
     let Some(ans) = prompt(o, &format!("Delete {}? [y/N]", label), "") else { return };
     if ans.to_lowercase() != "y" { return; }
-    let lp = p.as_local_mut().unwrap();
+    let lp = p.as_local_mut();
     for name in &names {
         let path = lp.path.join(name);
         if let Err(e) = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) } {
@@ -1137,8 +936,7 @@ fn op_delete(o: &mut Out, p: &mut Pane) {
 }
 
 fn op_mkdir(o: &mut Out, p: &mut Pane) {
-    if p.is_remote() { flash(o, " Remote mkdir not supported"); return; }
-    let lp  = p.as_local_mut().unwrap();
+    let lp  = p.as_local_mut();
     let Some(name) = prompt(o, "New directory", "") else { return };
     if name.is_empty() { return; }
     if let Err(e) = fs::create_dir_all(lp.path.join(&name)) {
@@ -1148,8 +946,7 @@ fn op_mkdir(o: &mut Out, p: &mut Pane) {
 }
 
 fn op_goto(o: &mut Out, p: &mut Pane) {
-    if p.is_remote() { flash(o, " Use ← → to navigate remote pane"); return; }
-    let lp   = p.as_local_mut().unwrap();
+    let lp   = p.as_local_mut();
     let curr = lp.path.display().to_string();
     let Some(tgt) = prompt(o, "Go to", &curr) else { return };
     if tgt.is_empty() { return; }
@@ -1164,7 +961,7 @@ fn op_goto(o: &mut Out, p: &mut Pane) {
 }
 
 fn op_sort(o: &mut Out, p: &mut Pane) {
-    let lp = match p { Pane::Local(lp) => lp, _ => return };
+    let Pane::Local(lp) = p;
     let current = match lp.sort { SortBy::Name => 0, SortBy::Size => 1, SortBy::Ext => 2 };
     let rev0    = lp.reverse;
     let Some(idx) = ({
@@ -1379,13 +1176,10 @@ fn op_rclone_mount(o: &mut Out, panes: &mut [Pane; 2], mounts: &mut Vec<String>)
 }
 
 fn navigate_right_to(panes: &mut [Pane; 2], path: &str) {
-    if let Pane::Local(lp) = &mut panes[1] {
-        lp.path = std::path::PathBuf::from(path);
-        lp.cursor = 0; lp.offset = 0;
-        lp.refresh();
-    } else {
-        panes[1] = Pane::Local(LocalPane::new(path));
-    }
+    let lp = panes[1].as_local_mut();
+    lp.path = std::path::PathBuf::from(path);
+    lp.cursor = 0; lp.offset = 0;
+    lp.refresh();
 }
 
 fn unmount_all(mounts: &[String]) {
@@ -1399,19 +1193,6 @@ fn unmount_all(mounts: &[String]) {
                 .status().map(|s| s.success()).unwrap_or(false);
             if ok { break; }
         }
-    }
-}
-
-fn op_connect_right(o: &mut Out, panes: &mut [Pane; 2]) {
-    let hosts: Vec<String> = load_netrc().into_iter().map(|e| e.machine).collect();
-    if hosts.is_empty() { flash(o, " No ~/.netrc entries found"); return; }
-    let Some(idx) = picker(o, "FTP (netrc)", &hosts) else { return };
-    let host = &hosts[idx];
-    flash(o, &format!(" Connecting to {}...", host));
-    let (user, pass) = netrc_creds(host).unwrap_or_default();
-    match Ftp::connect(host, &user, &pass) {
-        Ok(ftp) => panes[1] = Pane::Remote(RemotePane::new(ftp)),
-        Err(e)  => flash(o, &format!(" Connection failed: {}", e)),
     }
 }
 
@@ -1429,16 +1210,16 @@ fn spawn_external(o: &mut Out, prog: &str, arg: &str) {
 
 fn op_view(o: &mut Out, p: &Pane) {
     let Some(e) = p.current() else { return };
-    if e.is_dir || p.is_remote() { return; }
-    let path  = p.as_local().unwrap().path.join(&e.name).display().to_string();
+    if e.is_dir { return; }
+    let path  = p.as_local().path.join(&e.name).display().to_string();
     let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".into());
     spawn_external(o, &pager, &path);
 }
 
 fn op_edit(o: &mut Out, p: &Pane) {
     let Some(e) = p.current() else { return };
-    if e.is_dir || p.is_remote() { return; }
-    let path   = p.as_local().unwrap().path.join(&e.name).display().to_string();
+    if e.is_dir { return; }
+    let path   = p.as_local().path.join(&e.name).display().to_string();
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     spawn_external(o, &editor, &path);
 }
@@ -1488,7 +1269,6 @@ const HELP_RIGHT: &[(&str, &str)] = &[
     ("s",                 "sort by name / size / extension"),
     ("R",                 "refresh"),
     ("C",                 "rclone remote mount"),
-    ("f",                 "FTP connect (netrc)"),
 ];
 
 fn draw_help_col(o: &mut Out, entries: &[(&str, &str)], row0: u16, col0: u16, w: usize) {
@@ -1616,8 +1396,7 @@ fn op_context_menu(o: &mut Out, panes: &mut [Pane; 2], active: usize, mounts: &m
         "Delete (F8/dd)".into(), "Select All (Ctrl+A)".into(),
         "Deselect All (Esc)".into(), "Sort…(s)".into(),
         "Go to…(g)".into(), "Sync panes (S)".into(),
-        "rclone mount (C)".into(), "FTP connect (f)".into(),
-        "Refresh (R)".into(),
+        "rclone mount (C)".into(), "Refresh (R)".into(),
     ];
     let Some(idx) = picker(o, "Menu", &items) else { return };
     render(o, panes, active); // clear picker overlay before next dialog
@@ -1635,23 +1414,18 @@ fn op_context_menu(o: &mut Out, panes: &mut [Pane; 2], active: usize, mounts: &m
         10 => { let (a, _) = split(panes, active); op_goto(o, a); }
         11 => op_sync_panes(panes, active),
         12 => op_rclone_mount(o, panes, mounts),
-        13 => op_connect_right(o, panes),
-        14 => panes[active].refresh(),
+        13 => panes[active].refresh(),
         _  => {}
     }
 }
 
 fn op_sync_panes(panes: &mut [Pane; 2], active: usize) {
-    let src_path = match &panes[active] {
-        Pane::Local(p) => p.path.clone(),
-        Pane::Remote(_) => return,
-    };
+    let src_path = panes[active].as_local().path.clone();
     let other = 1 - active;
-    if let Pane::Local(op) = &mut panes[other] {
-        op.path = src_path;
-        op.cursor = 0; op.offset = 0;
-        op.refresh();
-    }
+    let op = panes[other].as_local_mut();
+    op.path = src_path;
+    op.cursor = 0; op.offset = 0;
+    op.refresh();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1659,17 +1433,6 @@ fn op_sync_panes(panes: &mut [Pane; 2], active: usize) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn make_pane(arg: &str) -> Pane {
-    if arg.starts_with("ftp://") {
-        let host = &arg[6..].split('/').next().unwrap_or(arg);
-        let (u, p) = netrc_creds(host).unwrap_or_default();
-        if let Ok(ftp) = Ftp::connect(host, &u, &p) { return Pane::Remote(RemotePane::new(ftp)); }
-    }
-    if !std::path::Path::new(arg).exists() {
-        let (u, p) = netrc_creds(arg).unwrap_or_default();
-        if !u.is_empty() {
-            if let Ok(ftp) = Ftp::connect(arg, &u, &p) { return Pane::Remote(RemotePane::new(ftp)); }
-        }
-    }
     Pane::Local(LocalPane::new(arg))
 }
 
@@ -1681,8 +1444,7 @@ fn split(panes: &mut [Pane; 2], active: usize) -> (&mut Pane, &mut Pane) {
 
 fn print_help() {
     println!("oc — two-pane terminal file manager\n");
-    println!("Usage:  oc [LEFT_PATH [RIGHT_PATH]]");
-    println!("        oc ftp://host  (opens FTP pane)\n");
+    println!("Usage:  oc [LEFT_PATH [RIGHT_PATH]]\n");
     println!("Navigation");
     println!("  Tab / Shift+Tab       switch active pane");
     println!("  ↑↓ / j k              move cursor");
@@ -1714,8 +1476,7 @@ fn print_help() {
     println!("  '                     go to path");
     println!("  s                     sort");
     println!("  R                     refresh");
-    println!("  C                     rclone remote mount");
-    println!("  f                     FTP connect (netrc)\n");
+    println!("  C                     rclone remote mount\n");
     println!("Mouse");
     println!("  left click            switch pane / move cursor");
     println!("  double click          enter dir or open file");
@@ -1829,7 +1590,6 @@ fn main() {
             Key::Char('s') => { let (a, _) = split(&mut panes, active); op_sort(&mut o, a); }
             Key::Char('S') => op_sync_panes(&mut panes, active),
             Key::Char('C') => op_rclone_mount(&mut o, &mut panes, &mut mounts),
-            Key::Char('f') => op_connect_right(&mut o, &mut panes),
             Key::Char('R') => panes[active].refresh(),
             Key::Char('?') => op_help(&mut o),
             Key::Char('q') | Key::Char('Q') => break,

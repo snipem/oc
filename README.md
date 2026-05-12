@@ -13,7 +13,6 @@ Usable two-pane terminal file manager. Zero external dependencies. Static musl b
 - Incremental search with `n`/`N` navigation
 - Sortable file list (name / size / extension, ascending / descending)
 - Human-readable file sizes
-- FTP remote pane support
 - rclone remote mount support
 - 24-bit truecolor CGA palette
 - Mouse support (click, scroll, right-click)
@@ -67,7 +66,6 @@ Usable two-pane terminal file manager. Zero external dependencies. Static musl b
 | `s` | Sort by name / size / extension |
 | `R` | Refresh |
 | `C` | rclone remote mount |
-| `f` | FTP connect (netrc) |
 
 ### Mouse
 
