@@ -8,51 +8,74 @@ Usable two-pane terminal file manager. Zero external dependencies. Static musl b
 
 - Two-pane layout with independent navigation
 - Directory browsing with Nerd Font icons
-- File operations: copy, move, rename, delete, mkdir
+- File operations: copy (with progress bar), move, rename, delete, mkdir
 - Multi-file selection
-- Incremental search
+- Incremental search with `n`/`N` navigation
 - Sortable file list (name / size / extension, ascending / descending)
 - Human-readable file sizes
 - FTP remote pane support
 - rclone remote mount support
 - 24-bit truecolor CGA palette
 - Mouse support (click, scroll, right-click)
-- SGR extended mouse mode
 
-## Keys
+## Key Bindings
+
+### Navigation
 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Switch active pane |
 | `↑` `↓` / `j` `k` | Move cursor |
-| `PgUp` `PgDn` | Page up / down |
-| `Home` `End` / `gg` `G` | First / last entry |
-| `Enter` `→` | Enter directory |
-| `←` `Backspace` | Parent directory |
+| `PgUp` / `PgDn` | Page up / down |
+| `Home` / `End` | First / last entry |
+| `gg` / `G` | Top / bottom |
+| `/` | Incremental search |
+| `n` / `N` | Next / prev match |
+| `Enter` / `→` | Enter directory or open file |
+| `←` / `Backspace` | Parent directory |
+
+### Selection
+
+| Key | Action |
+|-----|--------|
 | `Insert` | Toggle selection + move down |
 | `Space` | Toggle selection |
 | `Ctrl+A` | Select all |
-| `Esc` | Clear selection |
-| `/` | Incremental search |
-| `'` | Go to path |
-| `s` | Sort dialog |
-| `S` | Sync panes (copy active path to other pane) |
-| `R` | Refresh |
-| `e` / `F4` | Edit file |
-| `r` / `F2` | Rename |
-| `dd` / `Delete` / `F8` | Delete |
-| `F5` | Copy |
-| `F6` | Move |
-| `F7` | Mkdir |
-| `F3` | View |
+| `Esc` | Deselect all |
+
+### File Operations
+
+| Key | Action |
+|-----|--------|
+| `F1` / `?` | This help |
+| `F2` / `r` | Rename |
+| `F3` | View in pager |
+| `F4` / `e` | Edit file |
+| `F5` | Copy to other pane |
+| `F6` | Move to other pane |
+| `F7` | Create directory |
+| `F8` / `dd` / `Del` | Delete |
 | `F9` | Context menu |
-| `?` / `F1` | Help |
-| `q` / `F10` | Quit |
-| `C` | rclone mount |
-| `f` | FTP connect |
-| Left-click | Switch pane / move cursor |
-| Double-click | Enter directory |
-| Right-click | Parent directory |
+| `F10` / `q` | Quit |
+
+### Misc
+
+| Key | Action |
+|-----|--------|
+| `S` | Sync panes (copy path to other) |
+| `'` | Go to path |
+| `s` | Sort by name / size / extension |
+| `R` | Refresh |
+| `C` | rclone remote mount |
+| `f` | FTP connect (netrc) |
+
+### Mouse
+
+| Action | Effect |
+|--------|--------|
+| Left click | Switch pane / move cursor |
+| Double click | Enter dir or open file |
+| Right click | Go to parent directory |
 | Scroll | Move cursor ±3 rows |
 
 ## Install

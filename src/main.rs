@@ -1443,64 +1443,111 @@ fn op_edit(o: &mut Out, p: &Pane) {
     spawn_external(o, &editor, &path);
 }
 
-const HELP_LINES: &[&str] = &[
-    "  Navigation                              ",
-    "  Tab           switch active pane        ",
-    "  ↑/↓           move cursor               ",
-    "  PgUp/PgDn     scroll page               ",
-    "  Home/End       first/last entry         ",
-    "  gg             go to top (vim)           ",
-    "  G              go to bottom (vim)        ",
-    "  /              incremental search        ",
-  "  n / N          next / prev match        ",
-    "  Enter/→        enter dir or open file   ",
-    "  ←/Backspace    go up (parent dir)       ",
-    "                                          ",
-    "  Selection                               ",
-    "  Insert         toggle + move down       ",
-    "  Space          toggle selection         ",
-    "  Ctrl+A         select all               ",
-    "  Esc            deselect all             ",
-    "                                          ",
-    "  File operations                         ",
-    "  F1 / ?         this help                ",
-    "  F2 / r         rename                   ",
-    "  F3             view file (pager)        ",
-    "  F4 / e         edit file                ",
-    "  F5             copy to other pane       ",
-    "  F6             move to other pane       ",
-    "  F7             create directory         ",
-    "  F8 / dd / Del  delete                   ",
-    "  F9             context menu             ",
-    "  F10 / q        quit                     ",
-    "                                          ",
-    "  Misc                                    ",
-    "  S              sync other pane here     ",
-    "  '              goto path                 ",
-    "  s              sort by …               ",
-    "  R              refresh                  ",
-    "  C              rclone remote mount      ",
-    "  f              FTP (netrc) connect      ",
-    "                                          ",
-    "  Mouse                                   ",
-    "  click          switch pane / cursor     ",
-    "  dbl-click      enter dir or open file   ",
-    "  scroll         scroll 3 rows            ",
+// ("key", "description") — empty key = section header, both empty = blank line
+const HELP_LEFT: &[(&str, &str)] = &[
+    ("Navigation",        ""),
+    ("Tab / Shift+Tab",   "switch active pane"),
+    ("↑ ↓  /  j k",      "move cursor"),
+    ("PgUp / PgDn",       "page up / down"),
+    ("Home / End",        "first / last entry"),
+    ("gg / G",            "top / bottom"),
+    ("/",                 "incremental search"),
+    ("n / N",             "next / prev match"),
+    ("Enter / →",         "enter dir or open file"),
+    ("← / Backspace",     "parent directory"),
+    ("",                  ""),
+    ("Selection",         ""),
+    ("Insert",            "toggle selection + move down"),
+    ("Space",             "toggle selection"),
+    ("Ctrl+A",            "select all"),
+    ("Esc",               "deselect all"),
+    ("",                  ""),
+    ("Mouse",             ""),
+    ("left click",        "switch pane / move cursor"),
+    ("double click",      "enter dir or open file"),
+    ("right click",       "go to parent directory"),
+    ("scroll",            "move cursor ±3 rows"),
 ];
+
+const HELP_RIGHT: &[(&str, &str)] = &[
+    ("File Operations",   ""),
+    ("F1 / ?",            "this help"),
+    ("F2 / r",            "rename"),
+    ("F3",                "view in pager"),
+    ("F4 / e",            "edit file"),
+    ("F5",                "copy to other pane"),
+    ("F6",                "move to other pane"),
+    ("F7",                "create directory"),
+    ("F8 / dd / Del",     "delete"),
+    ("F9",                "context menu"),
+    ("F10 / q",           "quit"),
+    ("",                  ""),
+    ("Misc",              ""),
+    ("S",                 "sync panes (copy path to other)"),
+    ("'",                 "go to path"),
+    ("s",                 "sort by name / size / extension"),
+    ("R",                 "refresh"),
+    ("C",                 "rclone remote mount"),
+    ("f",                 "FTP connect (netrc)"),
+];
+
+fn draw_help_col(o: &mut Out, entries: &[(&str, &str)], row0: u16, col0: u16, w: usize) {
+    let key_w = 18usize;
+    for (i, &(key, desc)) in entries.iter().enumerate() {
+        goto(o, row0 + i as u16, col0);
+        if key.is_empty() && desc.is_empty() {
+            // blank spacer
+            tc!(o, bg 0x00,0x00,0xAA); write!(o, "{:<w$}", "", w = w).unwrap();
+        } else if desc.is_empty() {
+            // section header
+            c_hdr_act(o);
+            write!(o, "{:<w$}", key, w = w).unwrap();
+        } else {
+            // key binding row
+            tc!(o, fg 0x55,0xFF,0xFF); tc!(o, bg 0x00,0x00,0xAA);
+            let key_trunc: String = key.chars().take(key_w).collect();
+            write!(o, "{:<kw$}", key_trunc, kw = key_w).unwrap();
+            tc!(o, fg 0xAA,0xAA,0xAA); tc!(o, bg 0x00,0x00,0xAA);
+            write!(o, " ").unwrap();
+            let desc_w = w.saturating_sub(key_w + 1);
+            let desc_trunc: String = desc.chars().take(desc_w).collect();
+            write!(o, "{:<dw$}", desc_trunc, dw = desc_w).unwrap();
+        }
+        c_reset(o);
+    }
+}
 
 fn op_help(o: &mut Out) {
     let (rows, cols) = term_size();
-    let n     = HELP_LINES.len();
-    let box_w = (HELP_LINES[0].len() + 2).min(cols as usize);
-    let total_h = n + 2;
-    let row0  = ((rows as usize).saturating_sub(total_h) / 2 + 1) as u16;
-    let col0  = ((cols as usize).saturating_sub(box_w)   / 2 + 1) as u16;
-    let inner_w = draw_nc_box(o, row0, col0, box_w, n, "Keybindings  (any key to close)");
-    for (i, line) in HELP_LINES.iter().enumerate() {
-        goto(o, row0 + 1 + i as u16, col0 + 1);
-        c_norm(o);
-        write!(o, "{:<w$}", line, w = inner_w).unwrap();
-    }
+    let (rows, cols) = (rows as usize, cols as usize);
+
+    // fill blue background
+    tc!(o, bg 0x00,0x00,0xAA);
+    for r in 1..=rows as u16 { goto(o, r, 1); write!(o, "{:<w$}", "", w = cols).unwrap(); }
+
+    // title bar
+    goto(o, 1, 1);
+    c_hdr_act(o);
+    write!(o, "{:^w$}", "  One Commander — Key Bindings  ", w = cols).unwrap();
+
+    // two columns
+    let gap      = 2usize;
+    let col_w    = cols.saturating_sub(gap * 3) / 2;
+    let left_x   = (gap + 1) as u16;
+    let right_x  = (gap * 2 + col_w + 1) as u16;
+    let content_rows = rows.saturating_sub(3); // title + footer + 1 padding
+    let left_rows  = HELP_LEFT.len().min(content_rows);
+    let right_rows = HELP_RIGHT.len().min(content_rows);
+
+    draw_help_col(o, &HELP_LEFT[..left_rows],   2, left_x,  col_w);
+    draw_help_col(o, &HELP_RIGHT[..right_rows],  2, right_x, col_w);
+
+    // footer
+    goto(o, rows as u16, 1);
+    c_status(o);
+    write!(o, "{:^w$}", "  Press any key to close  ", w = cols).unwrap();
+    c_reset(o);
+
     o.flush().unwrap();
     read_key();
 }
