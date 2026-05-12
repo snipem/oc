@@ -770,7 +770,7 @@ fn prompt(o: &mut Out, label: &str, default: &str) -> Option<String> {
         match read_key() {
             Key::Esc                              => { hide_cur(o); return None; }
             Key::Enter                            => { hide_cur(o); return Some(buf.iter().collect()); }
-            Key::Char('\x7f') | Key::Char('\x08') => { buf.pop(); }
+            Key::Backspace => { buf.pop(); }
             Key::Char(c) if !c.is_control()      => buf.push(c),
             _ => {}
         }
