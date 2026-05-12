@@ -1,0 +1,11 @@
+[package]
+name = "oc"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "oc"
+path = "src/main.rs"
+
+[dependencies]
+# none — zero external crates, raw syscalls for terminal I/O
