@@ -468,19 +468,58 @@ fn file_icon(name: &str, is_dir: bool) -> char {
 enum SortBy { #[default] Name, Size, Ext }
 
 #[derive(Clone)]
-struct FileEntry { name: String, is_dir: bool, size: u64 }
+struct FileEntry { name: String, is_dir: bool, size: u64, mtime: Option<std::time::SystemTime> }
+
+// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+fn days_to_ymd(days: u64) -> (u32, u32, u32) {
+    let z  = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    let doy = doe - (365*yoe + yoe/4 - yoe/100);
+    let mp  = (5*doy + 2) / 153;
+    let d   = doy - (153*mp + 2)/5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y   = if m <= 2 { yoe as i64 + era * 400 + 1 } else { yoe as i64 + era * 400 };
+    (y as u32, m as u32, d as u32)
+}
+
+fn fmt_mtime(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO).as_secs();
+    let mins  = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    let (y, mo, d) = days_to_ymd(secs / 86400);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, mo, d, hours, mins)
+}
+
+// Minimum inner_w to show the timestamp column (leaves ≥16 chars for the name).
+const TS_MIN_WIDTH: usize = 42;
+// Width of the formatted timestamp string ("YYYY-MM-DD HH:MM" = 16 chars).
+const TS_WIDTH: usize = 16;
 
 impl FileEntry {
-    fn display(&self, w: usize) -> String {
+    fn display(&self, w: usize, show_ts: bool) -> String {
         let icon  = file_icon(&self.name, self.is_dir);
         let tag   = if self.is_dir { "/" } else { " " };
         let sz    = if self.is_dir { "     ".to_string() } else { human_size(self.size) };
-        let avail = w.saturating_sub(9);  // icon(1) + sp(1) + name + sp(1) + size(5) + 1
-        let label = format!("{}{}", self.name, tag);
-        let label = if label.len() > avail {
-            format!("…{}", &label[label.len().saturating_sub(avail.saturating_sub(1))..])
-        } else { label };
-        format!("{} {:<avail$} {:>5}", icon, label, sz, avail = avail)
+        if show_ts {
+            // layout: icon sp name sp ts sp size  →  1+1+avail+1+TS_WIDTH+1+5
+            let avail = w.saturating_sub(9 + TS_WIDTH + 1);
+            let label = format!("{}{}", self.name, tag);
+            let label = if label.len() > avail {
+                format!("…{}", &label[label.len().saturating_sub(avail.saturating_sub(1))..])
+            } else { label };
+            let ts = self.mtime.map(fmt_mtime).unwrap_or_else(|| " ".repeat(TS_WIDTH));
+            format!("{} {:<avail$} {:>5} {}", icon, label, sz, ts, avail = avail)
+        } else {
+            let avail = w.saturating_sub(9);  // icon(1) + sp(1) + name + sp(1) + size(5) + 1
+            let label = format!("{}{}", self.name, tag);
+            let label = if label.len() > avail {
+                format!("…{}", &label[label.len().saturating_sub(avail.saturating_sub(1))..])
+            } else { label };
+            format!("{} {:<avail$} {:>5}", icon, label, sz, avail = avail)
+        }
     }
 }
 
@@ -566,8 +605,10 @@ impl LocalPane {
             for e in rd.flatten() {
                 let name   = e.file_name().to_string_lossy().into_owned();
                 let is_dir = e.path().is_dir();
-                let size   = e.metadata().map(|m| m.len()).unwrap_or(0);
-                items.push(FileEntry { name, is_dir, size });
+                let meta   = e.metadata().ok();
+                let size   = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime  = meta.as_ref().and_then(|m| m.modified().ok());
+                items.push(FileEntry { name, is_dir, size, mtime });
             }
         }
         let sort = self.sort;
@@ -588,7 +629,7 @@ impl LocalPane {
             dir_ord.then(file_ord)
         });
         if self.path.parent().is_some() {
-            items.insert(0, FileEntry { name: "..".to_string(), is_dir: true, size: 0 });
+            items.insert(0, FileEntry { name: "..".to_string(), is_dir: true, size: 0, mtime: None });
         }
         self.entries       = items;
         self.cursor        = self.cursor.min(self.entries.len().saturating_sub(1));
@@ -690,7 +731,7 @@ fn draw_bottom_border(o: &mut Out, row: u16, cols: usize, half: usize) {
 // Draw only the content cells of one pane (no title, no borders).
 // col0 / inner_w are the inner dimensions (already excluding the │ chars).
 fn draw_pane_content(o: &mut Out, pane: &mut Pane, active: bool,
-                     row0: u16, n_rows: usize, col0: u16, inner_w: usize) {
+                     row0: u16, n_rows: usize, col0: u16, inner_w: usize, show_ts: bool) {
     let cursor = pane.cursor();
     let offset = {
         let off = pane.offset();
@@ -716,7 +757,7 @@ fn draw_pane_content(o: &mut Out, pane: &mut Pane, active: bool,
         else if selected  { c_sel_file(o); }
         else if e.is_dir  { c_dir(o); }
         else              { c_norm(o); }
-        let line    = e.display(inner_w);
+        let line    = e.display(inner_w, show_ts);
         let trimmed = trunc_cols(&line, inner_w);
         let padding = inner_w.saturating_sub(str_cols(trimmed));
         write!(o, "{}{:pad$}", trimmed, "", pad = padding).unwrap();
@@ -805,8 +846,9 @@ fn render(o: &mut Out, panes: &mut [Pane; 2], active: usize) {
     draw_top_border(o, cols, half, &lt, &rt, active);
 
     // pane content (inner columns, no │ chars)
-    draw_pane_content(o, &mut panes[0], active == 0, 2, n_content, 2,                 inner_left);
-    draw_pane_content(o, &mut panes[1], active == 1, 2, n_content, half as u16 + 2,   inner_right);
+    let show_ts = inner_left >= TS_MIN_WIDTH;
+    draw_pane_content(o, &mut panes[0], active == 0, 2, n_content, 2,                 inner_left,  show_ts);
+    draw_pane_content(o, &mut panes[1], active == 1, 2, n_content, half as u16 + 2,   inner_right, inner_right >= TS_MIN_WIDTH);
 
     // draw ║ side/middle borders over content rows (after content so colour is correct)
     c_norm(o);
@@ -1824,14 +1866,14 @@ fn dump_ui(left: &str, right: &str, width: usize) {
         print!("║");
         if let Some(e) = lp.entries.get(i) {
             let m = if i == lp.cursor { '>' } else if lp.selected.contains(&i) { '*' } else { ' ' };
-            print!("{} {}", m, e.display(col_l));
+            print!("{} {}", m, e.display(col_l, col_l >= TS_MIN_WIDTH));
         } else {
             print!("{:<w$}", "", w = inner_l);
         }
         print!("║");
         if let Some(e) = rp.entries.get(i) {
             let m = if i == rp.cursor { '>' } else if rp.selected.contains(&i) { '*' } else { ' ' };
-            print!("{} {}", m, e.display(col_r));
+            print!("{} {}", m, e.display(col_r, col_r >= TS_MIN_WIDTH));
         } else {
             print!("{:<w$}", "", w = inner_r);
         }
