@@ -15,6 +15,7 @@
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inline syscalls — x86-64 Linux, no libc
@@ -35,8 +36,60 @@ unsafe fn sys3(n: u64, a: u64, b: u64, c: u64) -> i64 {
     r
 }
 
-const SYS_READ:  u64 = 0;
-const SYS_IOCTL: u64 = 16;
+#[inline(always)]
+unsafe fn sys4(n: u64, a: u64, b: u64, c: u64, d: u64) -> i64 {
+    let r: i64;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") n as i64 => r,
+            in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d,
+            out("rcx") _, out("r11") _,
+            options(nostack)
+        );
+    }
+    r
+}
+
+static RESIZED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigwinch_handler(_: i32) {
+    RESIZED.store(true, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn sigreturn_trampoline() {
+    unsafe {
+        std::arch::asm!(
+            "mov rax, 15",   // SYS_RT_SIGRETURN
+            "syscall",
+            options(nostack, noreturn)
+        );
+    }
+}
+
+#[repr(C)]
+struct SigAction {
+    sa_handler:  extern "C" fn(i32),
+    sa_flags:    u64,
+    sa_restorer: unsafe extern "C" fn(),
+    sa_mask:     [u64; 16],
+}
+
+fn install_sigwinch() {
+    let sa = SigAction {
+        sa_handler:  sigwinch_handler,
+        sa_flags:    SA_RESTORER,
+        sa_restorer: sigreturn_trampoline,
+        sa_mask:     [0; 16],
+    };
+    unsafe { sys4(SYS_RT_SIGACTION, SIGWINCH, &sa as *const SigAction as u64, 0, 8); }
+}
+
+const SYS_READ:          u64 = 0;
+const SYS_IOCTL:         u64 = 16;
+const SYS_RT_SIGACTION:  u64 = 13;
+const SIGWINCH:          u64 = 28;
+const SA_RESTORER:       u64 = 0x04000000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal raw mode
@@ -109,9 +162,11 @@ fn term_size() -> (u16, u16) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn read_byte() -> u8 {
-    let mut b = 0u8;
-    unsafe { sys3(SYS_READ, 0, &mut b as *mut u8 as u64, 1); }
-    b
+    loop {
+        let mut b = 0u8;
+        if unsafe { sys3(SYS_READ, 0, &mut b as *mut u8 as u64, 1) } == 1 { return b; }
+        // EINTR — retry (SIGWINCH handled at read_key level)
+    }
 }
 
 fn read_byte_timed(tenths: u8) -> Option<u8> {
@@ -135,6 +190,7 @@ enum Key {
     Esc, F(u8),
     Click  { btn: u8, col: u16, row: u16 },
     Scroll { up: bool, col: u16, row: u16 },
+    Resize,
 }
 
 // Parse up to 3 semicolon-separated decimal numbers from a byte slice.
@@ -204,7 +260,14 @@ fn parse_csi(buf: &[u8]) -> Option<Key> {
 
 fn read_key() -> Key {
     'outer: loop {
-        return match read_byte() {
+        // First byte — interruptible so SIGWINCH can surface as Key::Resize
+        let first = loop {
+            let mut b = 0u8;
+            let n = unsafe { sys3(SYS_READ, 0, &mut b as *mut u8 as u64, 1) };
+            if n == 1 { break b; }
+            if RESIZED.swap(false, Ordering::Relaxed) { return Key::Resize; }
+        };
+        return match first {
             0x1b => match read_byte_timed(1) {
                 Some(b'[') => {
                     // Collect full CSI sequence: everything up to and including
@@ -675,6 +738,18 @@ const FKEYS: &[(&str, &str)] = &[
     ("10", "Quit"),
 ];
 
+fn fkey_at_col(col: u16) -> Option<usize> {
+    let mut used = 0usize;
+    for (i, &(num, label)) in FKEYS.iter().enumerate() {
+        let entry_len = num.len() + label.len() + 1;
+        if col as usize >= used + 1 && col as usize <= used + entry_len {
+            return Some(i);
+        }
+        used += entry_len;
+    }
+    None
+}
+
 fn draw_fkey_bar(o: &mut Out, rows: u16, cols: usize) {
     goto(o, rows, 1);
     let mut used = 0usize;
@@ -1084,12 +1159,23 @@ fn op_delete(o: &mut Out, p: &mut Pane) {
     if names.is_empty() { return; }
     let label = if names.len() == 1 { format!("'{}'", names[0]) }
                 else { format!("{} items", names.len()) };
-    let Some(ans) = prompt(o, &format!("Trash {}? [y/N]", label), "") else { return };
+    let is_remote = p.as_local().path.starts_with("/tmp/oc-");
+    let question = if is_remote {
+        format!("PERMANENTLY DELETE {} from remote? [y/N]", label)
+    } else {
+        format!("Trash {}? [y/N]", label)
+    };
+    let Some(ans) = prompt(o, &question, "") else { return };
     if ans.to_lowercase() != "y" { return; }
     let lp = p.as_local_mut();
     for name in &names {
         let path = lp.path.join(name);
-        if let Err(e) = trash_file(&path) {
+        let result = if is_remote {
+            if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }
+        } else {
+            trash_file(&path)
+        };
+        if let Err(e) = result {
             flash(o, &format!(" Error: {}", e));
         }
     }
@@ -1279,6 +1365,19 @@ fn picker(o: &mut Out, title: &str, items: &[String]) -> Option<usize> {
             Key::Enter                  => return Some(cursor),
             Key::Up   if cursor > 0      => cursor -= 1,
             Key::Down if cursor + 1 < n  => cursor += 1,
+            Key::Click { btn: 0, col, row } => {
+                let r = row as usize;
+                let c = col as usize;
+                if r > row0 as usize && r <= row0 as usize + visible
+                    && c >= col0 as usize && c < col0 as usize + box_w
+                {
+                    let idx = offset + (r - row0 as usize - 1);
+                    if idx < n {
+                        if idx == cursor { return Some(cursor); }
+                        cursor = idx;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1515,7 +1614,8 @@ fn op_help(o: &mut Out) {
     // title bar
     goto(o, 1, 1);
     c_hdr_act(o);
-    write!(o, "{:^w$}", "  One Commander — Key Bindings  ", w = cols).unwrap();
+    let title = format!("  One Commander {}— Key Bindings  ", concat!("v", env!("CARGO_PKG_VERSION"), " "));
+    write!(o, "{:^w$}", title, w = cols).unwrap();
 
     // two columns
     let gap      = 2usize;
@@ -1777,6 +1877,7 @@ fn main() {
     let mut mounts: Vec<String> = Vec::new();
     let mut last_query = String::new();
 
+    install_sigwinch();
     hide_cur(&mut o);
     mouse_on(&mut o);
     clr(&mut o);
@@ -1784,7 +1885,7 @@ fn main() {
 
     let mut last_char = '\0';
 
-    loop {
+    'main: loop {
         render(&mut o, &mut panes, active);
         let (rows, cols) = term_size();
         let visible = rows as usize - 4; // top border + content + bottom border + black + fkeys
@@ -1851,7 +1952,7 @@ fn main() {
             Key::F(7)  => { let (a, _) = split(&mut panes, active); op_mkdir(&mut o, a); }
             Key::F(8)  => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
             Key::F(9)  => op_context_menu(&mut o, &mut panes, active, &mut mounts),
-            Key::F(10) => break,
+            Key::F(10) => break 'main,
 
             // ── Vim-style letter bindings ───────────────────────────────────
             Key::Char('V') => {
@@ -1890,22 +1991,40 @@ fn main() {
             Key::Char('C') => op_rclone_mount(&mut o, &mut panes, &mut mounts),
             Key::Char('R') => panes[active].refresh(),
             Key::Char('?') => op_help(&mut o),
-            Key::Char('q') | Key::Char('Q') => break,
+            Key::Char('q') | Key::Char('Q') => break 'main,
+
+            Key::Resize => { clr(&mut o); } // re-render happens at top of loop
 
             // ── Mouse ────────────────────────────────────────────────────────
             Key::Click { btn: 0, col, row } => {
-                let clicked = if col <= half { 0usize } else { 1usize };
-                if row >= 2 {
-                    let idx = panes[clicked].offset() + (row as usize - 2);
-                    if idx < panes[clicked].entries().len() {
-                        if clicked == active && idx == panes[clicked].cursor() {
-                            panes[clicked].enter();
-                        } else {
-                            active = clicked;
-                            *panes[clicked].cursor_mut() = idx;
-                        }
+                if row == rows {
+                    match fkey_at_col(col) {
+                        Some(0) => op_help(&mut o),
+                        Some(1) => { let (a, _) = split(&mut panes, active); op_rename(&mut o, a); }
+                        Some(2) => { let (a, _) = split(&mut panes, active); op_view(&mut o, a); }
+                        Some(3) => { let (a, _) = split(&mut panes, active); op_edit(&mut o, a); }
+                        Some(4) => { let (a, b) = split(&mut panes, active); op_copy(&mut o, a, b); }
+                        Some(5) => { let (a, b) = split(&mut panes, active); op_move(&mut o, a, b); }
+                        Some(6) => { let (a, _) = split(&mut panes, active); op_mkdir(&mut o, a); }
+                        Some(7) => { let (a, _) = split(&mut panes, active); op_delete(&mut o, a); }
+                        Some(8) => op_context_menu(&mut o, &mut panes, active, &mut mounts),
+                        Some(9) => break 'main,
+                        _ => {}
+                    }
+                } else {
+                    let clicked = if col <= half { 0usize } else { 1usize };
+                    if row >= 2 {
+                        let idx = panes[clicked].offset() + (row as usize - 2);
+                        if idx < panes[clicked].entries().len() {
+                            if clicked == active && idx == panes[clicked].cursor() {
+                                panes[clicked].enter();
+                            } else {
+                                active = clicked;
+                                *panes[clicked].cursor_mut() = idx;
+                            }
+                        } else { active = clicked; }
                     } else { active = clicked; }
-                } else { active = clicked; }
+                }
             }
             Key::Click { btn: 2, col, .. } => {
                 let clicked = if col <= half { 0usize } else { 1usize };
